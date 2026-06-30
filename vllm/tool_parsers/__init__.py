@@ -226,6 +226,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "apertus_tool_parser",
         "ApertusToolParser",
     ),
+    "solar_open": (
+        "solar_open_tool_parser",
+        "SolarOpenToolParser",
+    ),
 }
 
 
