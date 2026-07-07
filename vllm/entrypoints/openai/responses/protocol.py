@@ -469,6 +469,13 @@ class ResponsesRequest(OpenAIBaseModel):
             extra_args["kv_transfer_params"] = self.kv_transfer_params
         if self.ec_transfer_params:
             extra_args["ec_transfer_params"] = self.ec_transfer_params
+        # Expose reasoning_effort / parallel_tool_calls to custom logits
+        # processors (e.g. Solar-Open template enforcer) via extra_args.
+        reasoning_effort = None if self.reasoning is None else self.reasoning.effort
+        if reasoning_effort is not None:
+            extra_args["reasoning_effort"] = reasoning_effort
+        if self.parallel_tool_calls is not None:
+            extra_args["parallel_tool_calls"] = self.parallel_tool_calls
 
         return SamplingParams.from_optional(
             temperature=temperature,

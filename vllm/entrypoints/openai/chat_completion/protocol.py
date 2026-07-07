@@ -696,6 +696,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
+        # Expose reasoning_effort / parallel_tool_calls to custom logits
+        # processors (e.g. Solar-Open template enforcer) via extra_args.
+        if self.reasoning_effort is not None:
+            extra_args["reasoning_effort"] = self.reasoning_effort
+        if self.parallel_tool_calls is not None:
+            extra_args["parallel_tool_calls"] = self.parallel_tool_calls
         return SamplingParams.from_optional(
             n=self.n,
             **sampling_params,
