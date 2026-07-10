@@ -374,6 +374,11 @@ class SolarOpen2KimiDeltaAttention(KimiGatedDeltaNetAttention):
     ) -> None:
         super().__init__(config, vllm_config, prefix)
         self.allow_neg_eigval = getattr(config, "kda_allow_neg_eigval", False)
+        # The ROCm AITER gated-RMSNorm fusion pass (cudagraph path) queries
+        # num_v_heads / head_v_dim on GDN layers to size the gated-norm pattern.
+        # For KDA the gated o_norm operates per value head == (num_heads, head_dim).
+        self.num_v_heads = self.num_heads
+        self.head_v_dim = self.head_dim
 
     def forward(
         self,
