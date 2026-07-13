@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.sampling_params import SamplingParams
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.sample.logits_processor import (
     AdapterLogitsProcessor,
     RequestLogitsProcessor,
@@ -12,6 +13,20 @@ from vllm.v1.sample.logits_processor import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+# Env flag to switch the Solar logits processors from the batched path back to
+# the per-request (per-row) path. Batched is the default; set the var to a
+# falsey value to fall back to the per-row path (e.g. for apple-to-apple
+# benchmarking against the same build).
+SOLAR_LOGITS_BATCHED_ENV = "SOLAR_LOGITS_BATCHED"
+
+
+def _batched_enabled() -> bool:
+    """Return True unless SOLAR_LOGITS_BATCHED is explicitly set to a falsey value."""
+    value = os.environ.get(SOLAR_LOGITS_BATCHED_ENV)
+    if value is None:
+        return True
+    return value.strip().lower() not in ("0", "false", "no", "off")
 
 # Hardcoded token IDs for Solar tokenizer
 
@@ -350,6 +365,21 @@ def _forbid_all_special_tokens(logits: torch.Tensor) -> None:
     logits[_ALL_SPECIAL_TOKEN_IDS] = NEG_INF
 
 
+# Pre-computed "keep" column lists for the batched plan. These are the columns
+# a "force" state restores after blanking the row (mirrors the .clone() reads /
+# 0.0 writes in __call__).
+_KEEP_THINK = [THINK_TOKEN_ID]
+_KEEP_CONTENT_TOOLCALLS = [CONTENT_TOKEN_ID, TOOL_CALLS_TOKEN_ID]
+_KEEP_END = [END_TOKEN_ID]
+_KEEP_BEGIN = [BEGIN_TOKEN_ID]
+_KEEP_ASSISTANT = [ASSISTANT_TOKEN_ID]
+_KEEP_TOOL_CALL_BEGIN = [TOOL_CALL_BEGIN_TOKEN_ID]
+_KEEP_TOOL_CALL_NAME = [TOOL_CALL_NAME_TOKEN_ID]
+_KEEP_TOOL_CALL_END = [TOOL_CALL_BEGIN_TOKEN_ID, CALLS_TOKEN_ID]
+
+_PLAN_NOOP = ("noop",)
+
+
 class SolarOpenTemplateEnforcer:
     """Request-level logits processor that enforces Solar Open chat template.
 
@@ -546,6 +576,104 @@ class SolarOpenTemplateEnforcer:
         except ValueError:
             return 0
 
+    def compute_plan(self, output_token_ids: list[int]) -> tuple:
+        """Advance the FSM on CPU and return a device-free action plan.
+
+        Mirrors the masking decisions in ``__call__`` but performs no tensor
+        ops, so the batched ``apply`` can fuse every request's masking into a
+        bounded number of kernels. The returned tuple is one of:
+          ("noop",)
+          ("forbid", cols)             forbid these columns
+          ("force_zero", cols)         set row to -inf, then set cols to 0.0
+          ("force_keep", cols)         set row to -inf, then restore cols' values
+          ("transform_forbid", dst, src, cols)
+                                       dst = max(dst, src), then forbid cols
+        """
+        self._update_state_incremental(output_token_ids)
+        state = self._state
+
+        # Handle structured outputs mode (mirror __call__): once reasoning is
+        # done (or for non-reasoning requests), let structured outputs own the
+        # logits.
+        if self._is_structured_outputs and (
+            not self._is_reasoning_request or state not in self._REASONING_STATES
+        ):
+            return _PLAN_NOOP
+
+        if state == GenerationState.INITIAL:
+            if self._is_reasoning_request:
+                return ("force_keep", _KEEP_THINK)
+            return ("force_keep", _KEEP_CONTENT_TOOLCALLS)
+
+        elif state in (GenerationState.THINK_BEGIN, GenerationState.THINK_IN_PROGRESS):
+            if (
+                self._reasoning_budget is not None
+                and state == GenerationState.THINK_IN_PROGRESS
+                and self._think_token_count >= self._reasoning_budget
+            ):
+                return ("force_zero", _KEEP_END)
+            # Invariant: dst (END_TOKEN_ID) must NOT be in the forbid list
+            # (_SPECIAL_EXCEPT_END). The batched apply forbids before writing the
+            # transform result, so a dst inside the forbid set would be wrongly
+            # set to -inf. _SPECIAL_EXCEPT_END excludes END by construction.
+            return (
+                "transform_forbid",
+                END_TOKEN_ID,
+                FLUSH_TOKEN_ID,
+                _SPECIAL_EXCEPT_END,
+            )
+
+        elif state == GenerationState.THINK_END:
+            return ("force_zero", _KEEP_BEGIN)
+
+        elif state == GenerationState.NEW_MESSAGE_BEGIN:
+            return ("force_zero", _KEEP_ASSISTANT)
+
+        elif state == GenerationState.NEW_MESSAGE_ASSISTANT:
+            return ("forbid", _SPECIAL_EXCEPT_CONTENT_TOOLCALLS)
+
+        elif state in (
+            GenerationState.CONTENT_BEGIN,
+            GenerationState.CONTENT_IN_PROGRESS,
+        ):
+            # Invariant: dst (FLUSH_TOKEN_ID) must NOT be in the forbid list
+            # (_SPECIAL_EXCEPT_FLUSH). See the THINK transform above for why.
+            return (
+                "transform_forbid",
+                FLUSH_TOKEN_ID,
+                END_TOKEN_ID,
+                _SPECIAL_EXCEPT_FLUSH,
+            )
+
+        elif state == GenerationState.TOOL_CALLS_BEGIN:
+            return ("force_keep", _KEEP_TOOL_CALL_BEGIN)
+
+        elif state == GenerationState.TOOL_CALL_BEGIN:
+            return ("forbid", _ALL_SPECIAL_TOKEN_IDS)
+
+        elif state == GenerationState.TOOL_CALL_ID_IN_PROGRESS:
+            if self._tool_call_id_token_count >= self._tool_call_id_budget:
+                return ("force_zero", _KEEP_TOOL_CALL_NAME)
+            return ("forbid", _SPECIAL_EXCEPT_TOOLCALL_NAME)
+
+        elif state == GenerationState.TOOL_CALL_NAME_BEGIN:
+            return ("forbid", _ALL_SPECIAL_TOKEN_IDS)
+
+        elif state == GenerationState.TOOL_CALL_NAME_IN_PROGRESS:
+            return ("forbid", _SPECIAL_EXCEPT_TOOLCALL_ARGS)
+
+        elif state == GenerationState.TOOL_CALL_ARGS_BEGIN:
+            return ("forbid", _ALL_SPECIAL_TOKEN_IDS)
+
+        elif state == GenerationState.TOOL_CALL_ARGS_IN_PROGRESS:
+            return ("forbid", _SPECIAL_EXCEPT_TOOLCALL_END)
+
+        elif state == GenerationState.TOOL_CALL_END:
+            return ("force_keep", _KEEP_TOOL_CALL_END)
+
+        # CALLS state (EOS) and any unhandled state: no masking.
+        return _PLAN_NOOP
+
     def __call__(
         self,
         output_token_ids: list[int],
@@ -708,6 +836,18 @@ class SolarOpenTemplateLogitsProcessor(AdapterLogitsProcessor):
     ):
         super().__init__(vllm_config, device, is_pin_memory)
 
+        # Batched path: fuse all per-request masking into a bounded number of
+        # kernels instead of one set of tiny kernels per row. Opt-in via env so
+        # both paths ship in the same build for apple-to-apple benchmarking.
+        self._device = device
+        self._is_pin_memory = is_pin_memory
+        self._batched = _batched_enabled()
+
+        # Reusable scalar fill tensors for index_put_ (broadcast, no per-step
+        # allocation). Built lazily on first apply so we honor the logits dtype.
+        self._neg_inf_scalar: torch.Tensor | None = None
+        self._zero_scalar: torch.Tensor | None = None
+
         # Dynamic reasoning budget settings for HIGH effort
         self._high_max = self._parse_env_int(
             "SOLAR_REASONING_BUDGET_HIGH_MAX", DEFAULT_REASONING_BUDGET_HIGH_MAX
@@ -780,6 +920,128 @@ class SolarOpenTemplateLogitsProcessor(AdapterLogitsProcessor):
     def is_argmax_invariant(self) -> bool:
         """This processor can change argmax result by forcing specific tokens."""
         return False
+
+    def _ensure_scalars(self, logits: torch.Tensor) -> None:
+        """Lazily build the reusable -inf/0.0 broadcast scalars for the logits
+        device (both are always created together as a pair)."""
+        if self._neg_inf_scalar is None or self._neg_inf_scalar.device != logits.device:
+            self._neg_inf_scalar = torch.tensor(
+                NEG_INF, dtype=logits.dtype, device=logits.device
+            )
+            self._zero_scalar = torch.tensor(
+                0.0, dtype=logits.dtype, device=logits.device
+            )
+
+    def _up(self, data: list, device) -> torch.Tensor:
+        """Upload an index list to the device (non-blocking H2D)."""
+        return async_tensor_h2d(data, torch.long, device, self._is_pin_memory)
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply Solar template masking to all rows.
+
+        When ``SOLAR_LOGITS_BATCHED`` is off, fall back to the base adapter's
+        per-request path (the reference baseline). When on, each request's FSM
+        produces a device-free plan and all plans are fused into a bounded set
+        of tensor ops, independent of batch size.
+
+        Ordering note: the per-row path does transform (max) BEFORE forbid within
+        a state; this batched path forbids (Phase 3) BEFORE writing the transform
+        result (Phase 4). The two orders agree only because, in every
+        ``transform_forbid`` plan, the transform destination column is never a
+        member of that state's forbid list (see the invariant notes in
+        ``compute_plan``). If that ever changes, Phase 4 would need to run before
+        Phase 3, or the dst would be clobbered to -inf.
+        """
+        if not self._batched or not self.req_info:
+            return super().apply(logits)
+
+        device = logits.device
+        self._ensure_scalars(logits)
+
+        # (row, col) pairs to set to -inf.
+        forbid_rows: list[int] = []
+        forbid_cols: list[int] = []
+        # Rows to blank entirely (then selectively restored below).
+        blank_rows: list[int] = []
+        # (row, col) pairs to set to 0.0 after blanking.
+        zero_rows: list[int] = []
+        zero_cols: list[int] = []
+        # (row, col) pairs whose original value must survive a row blank.
+        keep_rows: list[int] = []
+        keep_cols: list[int] = []
+        # transform: dst = max(dst, src) at (row, dst_col) reading (row, src_col).
+        tr_rows: list[int] = []
+        tr_dst: list[int] = []
+        tr_src: list[int] = []
+
+        for req_idx, req_lp in self.req_info.items():
+            enforcer: SolarOpenTemplateEnforcer = req_lp.func
+            output_ids: list[int] = req_lp.args[-1]
+            plan = enforcer.compute_plan(output_ids)
+            kind = plan[0]
+
+            if kind == "noop":
+                continue
+            elif kind == "forbid":
+                cols = plan[1]
+                forbid_rows.extend([req_idx] * len(cols))
+                forbid_cols.extend(cols)
+            elif kind == "force_zero":
+                cols = plan[1]
+                blank_rows.append(req_idx)
+                zero_rows.extend([req_idx] * len(cols))
+                zero_cols.extend(cols)
+            elif kind == "force_keep":
+                cols = plan[1]
+                blank_rows.append(req_idx)
+                keep_rows.extend([req_idx] * len(cols))
+                keep_cols.extend(cols)
+            elif kind == "transform_forbid":
+                _, dst_col, src_col, cols = plan
+                tr_rows.append(req_idx)
+                tr_dst.append(dst_col)
+                tr_src.append(src_col)
+                forbid_rows.extend([req_idx] * len(cols))
+                forbid_cols.extend(cols)
+
+        # Phase 1: gather values that must survive a subsequent blank/forbid.
+        keep_vals = None
+        if keep_rows:
+            kr = self._up(keep_rows, device)
+            kc = self._up(keep_cols, device)
+            keep_vals = logits[kr, kc]
+
+        tr_new = None
+        if tr_rows:
+            trr = self._up(tr_rows, device)
+            trd = self._up(tr_dst, device)
+            trs = self._up(tr_src, device)
+            tr_new = torch.maximum(logits[trr, trd], logits[trr, trs])
+
+        # Phase 2: blank whole rows (force_zero / force_keep).
+        if blank_rows:
+            br = self._up(blank_rows, device)
+            logits.index_fill_(0, br, NEG_INF)
+
+        # Phase 3: forbid individual columns (plain forbid + transform forbid).
+        if forbid_rows:
+            fr = self._up(forbid_rows, device)
+            fc = self._up(forbid_cols, device)
+            logits.index_put_((fr, fc), self._neg_inf_scalar)
+
+        # Phase 4: restore / write kept and transformed values.
+        if zero_rows:
+            zr = self._up(zero_rows, device)
+            zc = self._up(zero_cols, device)
+            logits.index_put_((zr, zc), self._zero_scalar)
+
+        if keep_vals is not None:
+            logits.index_put_((kr, kc), keep_vals)
+
+        if tr_new is not None:
+            logits.index_put_((trr, trd), tr_new)
+
+        return logits
 
     def new_req_logits_processor(
         self,

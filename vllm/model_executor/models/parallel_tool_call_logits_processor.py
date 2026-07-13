@@ -2,7 +2,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.model_executor.models.solar_open_logits_processor import (
+    _batched_enabled,
+)
 from vllm.sampling_params import SamplingParams
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.sample.logits_processor import (
     AdapterLogitsProcessor,
     RequestLogitsProcessor,
@@ -14,6 +18,8 @@ if TYPE_CHECKING:
 # Hardcoded token IDs for Solar tokenizer
 TOOL_CALL_END_TOKEN_ID = 32  # <|tool_call:end|>
 CALLS_TOKEN_ID = 25  # <|calls|>
+
+NEG_INF = float("-inf")
 
 
 class SingleToolCallEnforcer:
@@ -68,10 +74,43 @@ class ParallelToolCallLogitsProcessor(AdapterLogitsProcessor):
         is_pin_memory: bool,
     ):
         super().__init__(vllm_config, device, is_pin_memory)
+        self._device = device
+        self._is_pin_memory = is_pin_memory
+        self._batched = _batched_enabled()
 
     def is_argmax_invariant(self) -> bool:
         """This processor can change argmax result by forcing specific tokens."""
         return False
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        """Force <|calls|> after <|tool_call:end|> for all matching rows at once.
+
+        Off by default (env-gated) so it matches the base adapter's per-row
+        path for apple-to-apple benchmarking.
+        """
+        if not self._batched or not self.req_info:
+            return super().apply(logits)
+
+        force_rows: list[int] = []
+        for req_idx, req_lp in self.req_info.items():
+            enforcer: SingleToolCallEnforcer = req_lp.func
+            output_ids: list[int] = req_lp.args[-1]
+            if output_ids and output_ids[-1] == enforcer._tool_call_end_token_id:
+                force_rows.append(req_idx)
+
+        if not force_rows:
+            return logits
+
+        device = logits.device
+        rows = async_tensor_h2d(force_rows, torch.long, device, self._is_pin_memory)
+        cols = async_tensor_h2d(
+            [CALLS_TOKEN_ID] * len(force_rows), torch.long, device, self._is_pin_memory
+        )
+        # Preserve the calls-token logit, blank the rows, then restore it.
+        keep_vals = logits[rows, cols]
+        logits.index_fill_(0, rows, NEG_INF)
+        logits.index_put_((rows, cols), keep_vals)
+        return logits
 
     def new_req_logits_processor(
         self,
