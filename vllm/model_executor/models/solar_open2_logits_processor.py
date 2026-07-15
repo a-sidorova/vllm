@@ -13,6 +13,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.sample.logits_processor import (
     AdapterLogitsProcessor,
     RequestLogitsProcessor,
@@ -405,7 +406,10 @@ def _mask_index_tensor(
     tensor = _MASK_TENSOR_CACHE.get(key)
     if tensor is None:
         in_vocab = [token_id for token_id in forbidden_ids if token_id < vocab_size]
-        tensor = torch.tensor(in_vocab, dtype=torch.long, device=device)
+        # Cached per distinct set (fires once), but still build it non-blocking:
+        # pin the host tensor and copy with non_blocking=True to avoid a queue-
+        # draining sync on first touch during serving.
+        tensor = async_tensor_h2d(in_vocab, torch.long, device, True)
         _MASK_TENSOR_CACHE[key] = tensor
     return tensor
 
@@ -839,6 +843,11 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
         is_pin_memory: bool,
     ):
         super().__init__(vllm_config, device, is_pin_memory)
+        self._is_pin_memory = is_pin_memory
+        # Reusable -inf broadcast scalar for index_put_ (built lazily on the
+        # logits device/dtype). index_put_ with a scalar does NOT implicitly
+        # sync, unlike 2-D advanced-index assignment.
+        self._neg_inf_scalar: torch.Tensor | None = None
         self.token_ids = resolve_solar_open2_token_ids(vllm_config)
         self.extra_eos_token_ids = resolve_solar_open2_extra_eos_ids(
             vllm_config, self.token_ids
@@ -923,22 +932,45 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
                     logits[req_idx] = new_logits
         vocab_size = logits.shape[-1]
         device = logits.device
+        if self._neg_inf_scalar is None or self._neg_inf_scalar.device != device:
+            self._neg_inf_scalar = torch.tensor(
+                NEG_INF, dtype=logits.dtype, device=device
+            )
+        neg_inf = self._neg_inf_scalar
+
         for forbidden_ids, rows in rows_by_ids.items():
             cols = _mask_index_tensor(forbidden_ids, vocab_size, device)
             if not cols.numel():
                 continue
-            row_indices = torch.tensor(rows, dtype=torch.long, device=device)
-            logits[row_indices.unsqueeze(1), cols.unsqueeze(0)] = NEG_INF
+            # Two implicit host<->device sync traps avoided here:
+            #  1. Build row indices with a NON-BLOCKING H2D (async_tensor_h2d);
+            #     a plain torch.tensor(..., device=device) is a blocking copy
+            #     that drains the GPU queue every step.
+            #  2. Mask with a flat index_put_ over the (row, col) cartesian
+            #     product + a cached -inf scalar. A 2-D advanced-index assign
+            #     (logits[rows[:,None], cols[None,:]] = x) implicitly syncs;
+            #     index_put_ does not.
+            row_indices = async_tensor_h2d(
+                rows, torch.long, device, self._is_pin_memory
+            )
+            n_rows, n_cols = row_indices.numel(), cols.numel()
+            fr = row_indices.repeat_interleave(n_cols)
+            fc = cols.repeat(n_rows)
+            logits.index_put_((fr, fc), neg_inf)
         if force_rows:
-            rows_t = torch.tensor(force_rows, dtype=torch.long, device=device)
+            rows_t = async_tensor_h2d(
+                force_rows, torch.long, device, self._is_pin_memory
+            )
             think_end = self.token_ids.think_end
             if think_end is not None and think_end < vocab_size:
-                # Budget-exhausted rows: mask everything except <|think:end|>
-                # with a single batched fill+restore (rare — at most one step
-                # per request).
-                saved = logits[rows_t, think_end].clone()
-                logits[rows_t, :] = NEG_INF
-                logits[rows_t, think_end] = saved
+                # Budget-exhausted rows: mask everything except <|think:end|>.
+                # index_fill_ blanks whole rows without a sync; gather+scatter
+                # the kept column via index_put_ (advanced indexing on a 1-D
+                # gather does not sync, but the 2-D assign form does).
+                saved = logits[rows_t, think_end]
+                logits.index_fill_(0, rows_t, NEG_INF)
+                te_cols = torch.full_like(rows_t, think_end)
+                logits.index_put_((rows_t, te_cols), saved)
             else:
                 # think_end unresolved/out of range: the cap is unenforceable,
                 # so fall back to normal reasoning masking for these rows
@@ -949,7 +981,10 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
                 )[(SolarOpen2State.REASONING, False)]
                 cols = _mask_index_tensor(forbidden_ids, vocab_size, device)
                 if cols.numel():
-                    logits[rows_t.unsqueeze(1), cols.unsqueeze(0)] = NEG_INF
+                    n_rows, n_cols = rows_t.numel(), cols.numel()
+                    fr = rows_t.repeat_interleave(n_cols)
+                    fc = cols.repeat(n_rows)
+                    logits.index_put_((fr, fc), neg_inf)
         return logits
 
 
