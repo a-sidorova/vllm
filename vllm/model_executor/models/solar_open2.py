@@ -42,7 +42,6 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fla.ops.kda import fused_kda_gate
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
@@ -394,10 +393,13 @@ class SolarOpen2KimiDeltaAttention(KimiGatedDeltaNetAttention):
         beta = self.b_proj(hidden_states)[0].float().sigmoid()
         if self.allow_neg_eigval:
             beta = beta * 2.0
+        # Pass the RAW (ungated) g1 to torch.ops.vllm.kda_attention. The op
+        # applies the KDA decay gate internally (chunk_kda_with_fused_gate in
+        # prefill, fused_kda_gate in decode). Pre-gating here double-applies the
+        # decay and degenerates generation.
         g1 = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
-        g1 = fused_kda_gate(g1, self.A_log, self.head_dim, g_bias=self.dt_bias)
         beta = beta.unsqueeze(0)
-        g1 = g1.unsqueeze(0)
+        g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
 
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
