@@ -934,7 +934,7 @@ class SolarOpenTemplateLogitsProcessor(AdapterLogitsProcessor):
 
     def _up(self, data: list, device) -> torch.Tensor:
         """Upload an index list to the device (non-blocking H2D)."""
-        return async_tensor_h2d(data, torch.long, device, self._is_pin_memory)
+        return async_tensor_h2d(data, device, torch.long)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply Solar template masking to all rows.

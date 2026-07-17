@@ -409,7 +409,7 @@ def _mask_index_tensor(
         # Cached per distinct set (fires once), but still build it non-blocking:
         # pin the host tensor and copy with non_blocking=True to avoid a queue-
         # draining sync on first touch during serving.
-        tensor = async_tensor_h2d(in_vocab, torch.long, device, True)
+        tensor = async_tensor_h2d(in_vocab, device, torch.long)
         _MASK_TENSOR_CACHE[key] = tensor
     return tensor
 
@@ -951,7 +951,7 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
             #     (logits[rows[:,None], cols[None,:]] = x) implicitly syncs;
             #     index_put_ does not.
             row_indices = async_tensor_h2d(
-                rows, torch.long, device, self._is_pin_memory
+                rows, device, torch.long
             )
             n_rows, n_cols = row_indices.numel(), cols.numel()
             fr = row_indices.repeat_interleave(n_cols)
@@ -959,7 +959,7 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
             logits.index_put_((fr, fc), neg_inf)
         if force_rows:
             rows_t = async_tensor_h2d(
-                force_rows, torch.long, device, self._is_pin_memory
+                force_rows, device, torch.long
             )
             think_end = self.token_ids.think_end
             if think_end is not None and think_end < vocab_size:
