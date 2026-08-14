@@ -400,7 +400,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   // TODO: Logic below will only work when K is multiple of 8
   //----------------------------------------------------
   for (uint32_t k = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
-       k < min__(Kap * N, max_lds_len); k += THRDS * WvPrGrp * A_CHUNK) {
+       k < min__((N - 1) * Kap + K, max_lds_len);
+       k += THRDS * WvPrGrp * A_CHUNK) {
   #if defined(__gfx950__)
     __builtin_amdgcn_global_load_lds((int*)(&A[k]), (int*)(&s[k]), 16, 0, 0);
   #else
@@ -641,7 +642,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   }
 
   for (uint32_t k = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
-       k < min__(Kap * N, max_lds_len); k += THRDS * WvPrGrp * A_CHUNK) {
+       k < min__((N - 1) * Kap + K, max_lds_len);
+       k += THRDS * WvPrGrp * A_CHUNK) {
   #if defined(__gfx950__)
     __builtin_amdgcn_global_load_lds((int*)(&A[k]), (int*)(&s[k]), 16, 0, 0);
   #else
@@ -901,7 +903,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   #define PCML
   #ifndef PCML
   for (uint32_t k = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
-       k < min__(Kap * N, max_lds_len); k += THRDS * WvPrGrp * A_CHUNK) {
+       k < min__((N - 1) * Kap + K, max_lds_len);
+       k += THRDS * WvPrGrp * A_CHUNK) {
     #if defined(__gfx950__)
     __builtin_amdgcn_global_load_lds((int*)(&A[k]), (int*)(&s[k]), 16, 0, 0);
     #else
@@ -2092,7 +2095,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   __shared__ fp8_t s[max_lds_len];
 
   for (uint32_t k = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
-       k < min__(Kap * N, max_lds_len); k += THRDS * WvPrGrp * A_CHUNK) {
+       k < min__((N - 1) * Kap + K, max_lds_len);
+       k += THRDS * WvPrGrp * A_CHUNK) {
   #if defined(__gfx950__)
     __builtin_amdgcn_global_load_lds((int*)(&A[k]), (int*)(&s[k]), 16, 0, 0);
   #else
@@ -2287,7 +2291,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   __shared__ fp8_t s[max_lds_len];
 
   for (uint32_t k = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
-       k < min__(Kap * N, max_lds_len); k += THRDS * WvPrGrp * A_CHUNK) {
+       k < min__((N - 1) * Kap + K, max_lds_len);
+       k += THRDS * WvPrGrp * A_CHUNK) {
   #if defined(__gfx950__)
     __builtin_amdgcn_global_load_lds((int*)(&A[k]), (int*)(&s[k]), 16, 0, 0);
   #else
