@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
+    VLLM_ROCM_USE_AITER_FUSED_ROUTER: bool = False
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_SITUV2: Literal["auto", "a4w4", "a8w4", "a16w4"] = "auto"
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
@@ -1290,6 +1291,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "a4w4", "a8w4", "a16w4", "0", "1"],
         case_sensitive=False,
+    ),
+    # Whether to run MoE routing (top-k selection, expert sort and MXFP4
+    # activation quant) inside the AITER expert kernel instead of as four
+    # kernels before it. Opt-in: needs gfx950, MXFP4 experts and an AITER
+    # build carrying module_fused_moe_routing.
+    "VLLM_ROCM_USE_AITER_FUSED_ROUTER": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FUSED_ROUTER", "False").lower() in ("true", "1")
     ),
     # MoE sorting dispatch policy for AITER fused MoE kernels.
     #   0 = auto (default): single-pass for small batches, multi-pass
