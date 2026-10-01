@@ -7,30 +7,30 @@
 # Both are pinned by commit and checked against recorded md5s, so a re-run on
 # another host produces byte-identical inputs or fails loudly.
 #
-#   ./fetch-sources.sh && docker build -t vllm-solar:0908-combined .
+#   ./fetch-sources.sh && docker build -t vllm-solar:1001-fp8 .
 set -euo pipefail
 cd "$(dirname "$0")"
 
 # --- pins ------------------------------------------------------------------
 VLLM_REMOTE=https://github.com/UpstageAI/upstage-vllm-amd
-VLLM_REF=sshliapn/features/solar_35b_model_optimizations_baseline
-# The branch tip carries this directory; the image is built from its parent,
-# which is the engine source proper.
-VLLM_COMMIT=8665505227ad4db9042ef55795e435a317ed8af6
+VLLM_REF=asidorov/features/solar_35b_fp8_model_optimizations
+# The FP8 fused-router engine commit. The branch tip may carry later changes to
+# this directory only; the image is built from this commit.
+VLLM_COMMIT=d8cde836bdf5dd787ff97fe6a30f49468d8aa29d
 
 AITER_REMOTE=https://github.com/sshlyapn/aiter.git
-AITER_REF=sshliapn/features/fused_router_v0.25_vllm_port
-AITER_COMMIT=7fb161ea1
+AITER_REF=asidorov/features/fused_router_fp8
+AITER_COMMIT=adcfd7630f0aa07358d35aa2528f506ae411321c
 
-# The overlay, and the md5 each file must have. These are the exact bytes the
-# 2026-09-17 image was built from; see README "Build record".
+# The overlay, and the md5 each file must have at $AITER_COMMIT. __init__.py and
+# optCompilerConfig.json are unchanged from the MXFP4-only image (7fb161ea1).
 OVERLAY_FILES=(
-  "aiter/fused_moe.py:b1bd2587081695ef2e25bb42f81efb0d"
+  "aiter/fused_moe.py:66abdfd775aadbb45f212ed3a31c0d08"
   "aiter/__init__.py:c67a8d22d27beed0d671e4bbee71e71c"
-  "aiter/ops/fused_moe_router.py:8afd18e4d0e958586a7b5266320b0222"
+  "aiter/ops/fused_moe_router.py:33d9b4933fee9c92685778242759d3cd"
   "aiter/jit/optCompilerConfig.json:d104a47acd966c3c78b984ba488c9fa5"
-  "csrc/kernels/fused_moe_router.cu:0e9eb508f087ad4286155037b9c16876"
-  "csrc/py_itfs_cu/fused_moe_router_entry.cu:85e5e798ff11ef1ba44373742098397a"
+  "csrc/kernels/fused_moe_router.cu:84d05cbeaf8cef5c00e64c60064c8933"
+  "csrc/py_itfs_cu/fused_moe_router_entry.cu:3d476801335301c2d5c2eec8a69d4e1e"
 )
 
 # --- engine ----------------------------------------------------------------
@@ -65,13 +65,20 @@ echo "==> aiter-overlay/  $AITER_COMMIT"
 AITER_TMP=$(mktemp -d)
 trap 'rm -rf "$AITER_TMP"' EXIT
 git -C "$AITER_TMP" init -q
-git -C "$AITER_TMP" fetch -q --depth 1 "$AITER_REMOTE" "$AITER_REF"
+# Fetch the pinned commit, not the branch tip, so a later push to $AITER_REF
+# cannot change the overlay. GitHub serves reachable commits by full SHA.
+git -C "$AITER_TMP" fetch -q --depth 1 "$AITER_REMOTE" "$AITER_COMMIT" 2>/dev/null ||
+    git -C "$AITER_TMP" fetch -q "$AITER_REMOTE" "$AITER_REF"
+git -C "$AITER_TMP" cat-file -e "$AITER_COMMIT^{commit}" 2>/dev/null || {
+    echo "$AITER_COMMIT is not on $AITER_REMOTE $AITER_REF" >&2
+    exit 1
+}
 
 fail=0
 for entry in "${OVERLAY_FILES[@]}"; do
     f=${entry%:*}; want=${entry#*:}
     mkdir -p "aiter-overlay/$(dirname "$f")"
-    git -C "$AITER_TMP" show "FETCH_HEAD:$f" > "aiter-overlay/$f"
+    git -C "$AITER_TMP" show "$AITER_COMMIT:$f" > "aiter-overlay/$f"
     got=$(md5sum "aiter-overlay/$f" | cut -d' ' -f1)
     if [ "$got" = "$want" ]; then
         printf '    %-45s ok\n' "$f"
@@ -81,7 +88,7 @@ for entry in "${OVERLAY_FILES[@]}"; do
     fi
 done
 [ "$fail" -eq 0 ] || {
-    echo "aiter branch has moved since the image was built; update the pins" >&2
+    echo "overlay at $AITER_COMMIT does not match the recorded md5s; update the pins" >&2
     exit 1
 }
 
@@ -91,7 +98,9 @@ done
 echo "==> tuning/"
 TUNING_FILES=(
   "fmoe_tuned_mxfp4_decode_solar.csv:f0fa6ab4172f19e20d6db66e459893e5"
+  "fmoe_tuned_35b_fp8_tp1.csv:f6d1636d2c402a63cb1a9ac422728524"
   "aiter_gemm_tuning.csv:ead0bff9f7f86962bc469fa9e75c1846"
+  "a8w8_tuned_gemm_35b_fp8.csv:99d452b34d5bc8ea4816edc5cb1ac04a"
 )
 for entry in "${TUNING_FILES[@]}"; do
     f=${entry%:*}; want=${entry#*:}
@@ -106,4 +115,4 @@ for entry in "${TUNING_FILES[@]}"; do
 done
 
 echo
-echo "Sources ready. Next:  docker build -t vllm-solar:0908-combined ."
+echo "Sources ready. Next:  docker build -t vllm-solar:1001-fp8 ."
