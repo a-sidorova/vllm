@@ -209,8 +209,14 @@ def backend_to_kernel_cls(
     elif backend == Fp8MoeBackend.AITER:
         from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
             AiterExperts,
+            AiterFusedRouterExperts,
         )
 
+        # Same policy as the MXFP4 oracle: only offered when opted into, and
+        # listed first because monolithic is preferred over modular. It
+        # declines on its own for schemes other than FP8 per-token.
+        if rocm_aiter_ops.is_fused_router_enabled():
+            return [AiterFusedRouterExperts, AiterExperts]
         return [AiterExperts]
 
     elif backend == Fp8MoeBackend.VLLM_CUTLASS:
@@ -836,6 +842,7 @@ def make_fp8_moe_kernel(
     assert prepare_finalize is not None
 
     logger.info_once("Using %s", prepare_finalize.__class__.__name__)
+    logger.info_once("Using %s", experts_cls.__name__)
 
     # Create Experts.
     if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:

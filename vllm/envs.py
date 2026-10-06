@@ -1292,10 +1292,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["auto", "a4w4", "a8w4", "a16w4", "0", "1"],
         case_sensitive=False,
     ),
-    # Whether to run MoE routing (top-k selection, expert sort and MXFP4
-    # activation quant) inside the AITER expert kernel instead of as four
-    # kernels before it. Opt-in: needs gfx950, MXFP4 experts and an AITER
-    # build carrying module_fused_moe_routing.
+    # Whether to run MoE routing (top-k selection, expert sort and activation
+    # quant) inside the AITER expert kernel instead of as four kernels before
+    # it. Opt-in: needs gfx950, MXFP4 or FP8 per-token experts and an AITER
+    # build whose fused router supports that scheme (FP8 needs the FP8 router).
     "VLLM_ROCM_USE_AITER_FUSED_ROUTER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FUSED_ROUTER", "False").lower() in ("true", "1")
     ),

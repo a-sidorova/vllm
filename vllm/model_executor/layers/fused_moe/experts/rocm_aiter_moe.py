@@ -300,6 +300,28 @@ def _rocm_aiter_gate_mode(
     return ""
 
 
+def _rocm_aiter_fused_router_quant_method(
+    quant_config: FusedMoEQuantConfig,
+) -> int | None:
+    """AITER quant type the fused router emits for this config, or None.
+
+    The router quantizes the activations itself, so it covers only the dynamic
+    schemes it has a kernel for: MXFP4 and FP8 per-token activations with FP8
+    per-channel weights. None means the caller has to run unfused.
+    """
+    if quant_config.use_mxfp4_w4a4:
+        return QuantMethod.BLOCK_1X32.value
+    if (
+        quant_config.use_fp8_w8a8
+        and quant_config.per_out_ch_quant
+        and quant_config.per_act_token_quant
+        and quant_config.block_shape is None
+        and quant_config.a1_scale is None
+    ):
+        return QuantMethod.PER_TOKEN.value
+    return None
+
+
 def rocm_aiter_fused_router_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -337,11 +359,9 @@ def rocm_aiter_fused_router_experts(
     if quant_config is None:
         quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
 
-    quant_method = (
-        QuantMethod.BLOCK_1X32.value
-        if quant_config.use_mxfp4_w4a4
-        else QuantMethod.NO.value
-    )
+    quant_method = _rocm_aiter_fused_router_quant_method(quant_config)
+    if quant_method is None:
+        return None
     hidden_pad, intermediate_pad = _rocm_aiter_moe_pads(hidden_states, moe_config)
     # No interleave hint: this path is SILU-only, and only the SWIGLUOAI
     # activations override it.
@@ -722,7 +742,7 @@ class AiterExperts(mk.FusedMoEExpertsModular):
 
 
 class AiterFusedRouterExperts(mk.FusedMoEExpertsMonolithic):
-    """AITER MXFP4 experts with the routing preamble fused into the kernel.
+    """AITER MXFP4 or FP8 per-token experts with the routing preamble fused in.
 
     Does the same work as `rocm_aiter_grouped_topk` + `AiterExperts`, but in
     one kernel instead of four. Falls back to that unfused path whenever AITER
@@ -828,6 +848,10 @@ class AiterFusedRouterExperts(mk.FusedMoEExpertsMonolithic):
             (kMxfp4Static, kMxfp4Dynamic): (
                 dtypes.fp4x2,
                 QuantMethod.BLOCK_1X32.value,
+            ),
+            (kFp8StaticChannelSym, kFp8DynamicTokenSym): (
+                dtypes.fp8,
+                QuantMethod.PER_TOKEN.value,
             ),
         }
         return SUPPORTED_W_A_TO_AITER.get((weight_key, activation_key), (None, None))
