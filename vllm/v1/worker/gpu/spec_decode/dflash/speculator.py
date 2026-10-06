@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -136,6 +137,13 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self._speculator_name,
                 self.attn_cg_support.min_cg_attn_backend,
             )
+        if wants_full and supports_full and not envs.VLLM_DFLASH_DRAFT_CUDAGRAPH:
+            logger.warning(
+                "%s draft runs eagerly (VLLM_DFLASH_DRAFT_CUDAGRAPH=0); "
+                "the target keeps its CUDA graphs.",
+                self._speculator_name,
+            )
+            supports_full = False
         # PIECEWISE cudagraphs are not supported for dflash.
         if wants_full and supports_full:
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY

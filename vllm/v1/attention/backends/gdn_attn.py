@@ -67,6 +67,14 @@ class GDNAttentionMetadata:
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
     uniform_spec_sequence_length: int | None = None  # None for ragged batches
 
+    # For requests not drafting this step: the block holding their committed
+    # recurrent state and how many tokens they accepted last step. A
+    # speculative step leaves the state on the draft ladder (column j = state
+    # after draft j) and the conv window rolled by num_accepted - 1, so a
+    # request that stops drafting has to be told where that landed.
+    non_spec_committed_state_indices: torch.Tensor | None = None
+    non_spec_num_accepted_tokens: torch.Tensor | None = None
+
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
@@ -177,6 +185,37 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        # Persistent so a FULL graph that folds the committed state reads the
+        # live step. Sized by max_num_seqs: unlike the buffers above these are
+        # also filled on batches that run outside a CUDA graph.
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        self.non_spec_committed_state_indices: torch.Tensor = torch.empty(
+            (max_num_seqs,), dtype=torch.int32, device=device
+        )
+        self.non_spec_num_accepted_tokens: torch.Tensor = torch.empty(
+            (max_num_seqs,), dtype=torch.int32, device=device
+        )
+
+    def _stage_committed_state_indices(
+        self, block_table: torch.Tensor, num_accepted_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """Ladder block holding each non-spec request's committed state."""
+        ladder = block_table[:, : self.num_spec + 1]
+        col = (num_accepted_tokens.long() - 1).clamp_(0, ladder.size(1) - 1)
+        num_reqs = col.size(0)
+        assert num_reqs <= self.non_spec_committed_state_indices.size(0)
+        committed = self.non_spec_committed_state_indices[:num_reqs]
+        committed.copy_(ladder.gather(1, col.unsqueeze(1))[:, 0], non_blocking=True)
+        return committed
+
+    def _stage_non_spec_accepted(
+        self, block_table: torch.Tensor, num_accepted_tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_reqs = num_accepted_tokens.size(0)
+        assert num_reqs <= self.non_spec_num_accepted_tokens.size(0)
+        accepted = self.non_spec_num_accepted_tokens[:num_reqs]
+        accepted.copy_(num_accepted_tokens, non_blocking=True)
+        return self._stage_committed_state_indices(block_table, accepted), accepted
 
     def _build_chunk_metadata(
         self,
@@ -246,6 +285,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         uniform_spec_sequence_length = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        non_spec_committed_state_indices: torch.Tensor | None = None
+        non_spec_num_accepted_tokens: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
@@ -302,6 +343,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
+            if self.use_spec_decode and num_accepted_tokens is not None:
+                non_spec_committed_state_indices, non_spec_num_accepted_tokens = (
+                    self._stage_non_spec_accepted(
+                        block_table_tensor,
+                        num_accepted_tokens[: block_table_tensor.size(0)],
+                    )
+                )
             num_accepted_tokens = None
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -413,6 +461,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
+            if non_spec_state_indices_tensor is not None:
+                non_spec_committed_state_indices, non_spec_num_accepted_tokens = (
+                    self._stage_non_spec_accepted(
+                        block_table_tensor[non_spec_sequence_masks_cpu],
+                        num_accepted_tokens[non_spec_sequence_masks_cpu],
+                    )
+                )
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
         chunk_indices: torch.Tensor | None = None
@@ -559,6 +614,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
             uniform_spec_sequence_length=uniform_spec_sequence_length,
+            non_spec_committed_state_indices=non_spec_committed_state_indices,
+            non_spec_num_accepted_tokens=non_spec_num_accepted_tokens,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
@@ -635,11 +692,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
             non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
 
+        committed_indices = None
+        if m.non_spec_committed_state_indices is not None:
+            assert m.non_spec_num_accepted_tokens is not None
+            committed_indices = self._stage_committed_state_indices(
+                blk_table if masks is None else blk_table[~masks],
+                m.non_spec_num_accepted_tokens,
+            )
+
         return replace(
             m,
             spec_state_indices_tensor=spec_indices,
             non_spec_state_indices_tensor=non_spec_indices,
             prefill_state_indices=prefill_indices,
+            non_spec_committed_state_indices=committed_indices,
         )
 
     def build_for_cudagraph_capture(

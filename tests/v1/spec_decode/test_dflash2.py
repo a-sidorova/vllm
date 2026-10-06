@@ -189,6 +189,28 @@ def test_selector_asks_for_fp32_proposal_logits():
     assert fill == float("-inf")
 
 
+def test_sample_idx_mapping_starts_inert():
+    """Padding sampling rows must be -1, not 0, before a real batch fills them.
+
+    ``gumbel_sample`` masks rows whose request index is negative. Zero is a
+    *valid* index, so a zero-initialised buffer makes every unpopulated row
+    scatter into request slot 0, and CUDA graph capture bakes that aliasing
+    into the replayed graph.
+
+    This is an initialisation-only invariant, so it is asserted directly on the
+    class source rather than by constructing a speculator (which needs a GPU).
+    """
+    import inspect
+
+    src = inspect.getsource(DFlashSpeculator.__init__)
+    assert "self.sample_idx_mapping = torch.full(" in src
+    assert "self.sample_idx_mapping = torch.zeros(" not in src
+
+    capture_src = inspect.getsource(DFlashSpeculator.capture)
+    assert "self.sample_idx_mapping.fill_(-1)" in capture_src
+    assert "self.sample_idx_mapping.zero_()" not in capture_src
+
+
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("variant", ["dflash2", "lilicorr", "lilicorr_plain"])
 def test_candidate_model_decoder_layer_cls(monkeypatch, variant):

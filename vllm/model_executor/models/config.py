@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -1016,6 +1017,45 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
+class KdaHybridSpecDecodeUnsupportedConfig(VerifyAndUpdateConfig):
+    """Gate speculative decoding on Solar-Open2 behind an explicit opt-in.
+
+    A misrouted KDA state index or a dropped ``num_accepted_tokens`` keeps every
+    shape valid and only conditions the model on the wrong recurrent state, so
+    the failure is silent. ``extract_hidden_states`` is not exempt: it feeds
+    each sampled token back as a draft and takes the same speculative path.
+
+    ``VLLM_KDA_SPEC_DECODE=1`` lifts the gate.
+    """
+
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None:
+            return
+
+        architecture = vllm_config.model_config.architecture
+        method = getattr(speculative_config, "method", None)
+
+        if envs.VLLM_KDA_SPEC_DECODE:
+            logger.warning(
+                "VLLM_KDA_SPEC_DECODE=1: enabling speculative method %r on %s. "
+                "Compare accuracy with speculation on and off before serving.",
+                method,
+                architecture,
+            )
+            return
+
+        raise ValueError(
+            f"{architecture} uses Kimi Delta Attention (KDA) linear-attention "
+            "layers whose speculative decoding path has not been validated on "
+            "hardware. It fails silently rather than loudly -- a misrouted "
+            "recurrent state index degrades quality without any error. Refusing "
+            f"to start with method {method!r}. Set VLLM_KDA_SPEC_DECODE=1 to "
+            "enable it."
+        )
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
@@ -1063,6 +1103,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
     "Qwen4ExpForConditionalGeneration": (Qwen4ExpForConditionalGenerationConfig),
     "Qwen4ExpMTP": Qwen4ExpMTPConfig,
+    "SolarOpen2ForCausalLM": KdaHybridSpecDecodeUnsupportedConfig,
     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,

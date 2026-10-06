@@ -2518,6 +2518,17 @@ class GPUModelRunner(
                     extra_attn_metadata_args["prev_last_scheduled_idx"] = (
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
                     )
+            elif self.speculative_config is not None and isinstance(
+                builder, GDNAttentionMetadataBuilder
+            ):
+                # A request that stops drafting still has its state parked at
+                # the ladder slot its last acceptance chose; only the
+                # acceptance count says where.
+                assert ubid is None, "UBatching not supported with GDN yet"
+                extra_attn_metadata_args = dict(
+                    num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
+                    num_decode_draft_tokens_cpu=None,
+                )
 
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(

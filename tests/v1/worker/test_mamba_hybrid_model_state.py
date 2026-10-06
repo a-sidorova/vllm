@@ -82,6 +82,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     state._align_mode = False
     state.recoverssm = None
     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
+    state._num_accepted_tokens_buf = torch.ones(4, dtype=torch.int32)
 
     # A verify decode, a padded prompt tail (128 of 129 prompt tokens already
     # computed), and a fresh prompt chunk of the same length.

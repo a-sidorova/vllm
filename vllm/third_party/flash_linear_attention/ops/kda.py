@@ -44,6 +44,23 @@ def fused_recurrent_kda_fwd(
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
+
+    # The kernel locates a state slot as ssm_state_indices + i_n *
+    # stride_indices_seq + i_t, so rows must be contiguous, and a 1-D index
+    # (one slot per sequence) cannot address a speculative draft ladder.
+    if ssm_state_indices is not None:
+        if ssm_state_indices.ndim == 2:
+            assert ssm_state_indices.stride(-1) == 1, (
+                "ssm_state_indices rows must be contiguous: the kernel assumes "
+                f"stride(-1) == 1, got {ssm_state_indices.stride()}"
+            )
+        else:
+            assert num_accepted_tokens is None, (
+                "1-D ssm_state_indices has one slot per sequence and cannot "
+                "address a speculative draft ladder; pass a 2-D index tensor "
+                "when num_accepted_tokens is set"
+            )
+
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = next_power_of_2(K), min(next_power_of_2(V), 8)
@@ -118,6 +135,7 @@ def fused_recurrent_kda(
     use_qk_l2norm_in_kernel: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.LongTensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if cu_seqlens is not None and q.shape[0] != 1:
@@ -139,7 +157,7 @@ def fused_recurrent_kda(
         inplace_final_state=inplace_final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=None,
+        num_accepted_tokens=num_accepted_tokens,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
     return o, final_state

@@ -85,6 +85,11 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # Per-step batch view handed to the attention metadata. Persistent so
+        # consumers captured in a FULL graph never read a stale allocation.
+        self._num_accepted_tokens_buf = torch.ones(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
         # kernel reusing the postprocess copy machinery, so the per-step src
@@ -271,7 +276,9 @@ class MambaHybridModelState(DefaultModelState):
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
-            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
+            assert num_reqs <= self._num_accepted_tokens_buf.size(0)
+            num_accepted_tokens = self._num_accepted_tokens_buf[:num_reqs]
+            num_accepted_tokens.fill_(1)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
                 input_batch.idx_mapping
             ]

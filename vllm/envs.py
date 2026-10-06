@@ -92,6 +92,8 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_KDA_SPEC_DECODE: bool = False
+    VLLM_DFLASH_DRAFT_CUDAGRAPH: bool = True
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -630,6 +632,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Opt-in: allow speculative decoding on Solar-Open2, whose KDA speculative
+    # path has not been validated by default. Without it the model fails
+    # closed at config time.
+    "VLLM_KDA_SPEC_DECODE": lambda: bool(int(os.getenv("VLLM_KDA_SPEC_DECODE", "0"))),
+    # Allow FULL CUDA graphs for the DFlash draft model. Set to 0 to run the
+    # draft eagerly while the target keeps its CUDA graphs.
+    "VLLM_DFLASH_DRAFT_CUDAGRAPH": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_DRAFT_CUDAGRAPH", "1"))
+    ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),

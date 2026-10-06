@@ -53,6 +53,8 @@ PRUNED_METADATA_FIELDS = {
     "uniform_spec_sequence_length",
     "flashinfer_prefill_query_start_loc",
     "flashinfer_prefill_seq_order",
+    "non_spec_committed_state_indices",
+    "non_spec_num_accepted_tokens",
 }
 
 

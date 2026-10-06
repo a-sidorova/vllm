@@ -102,9 +102,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from .interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
 )
@@ -129,6 +131,13 @@ def is_gqa_layer(config, layer_idx: int) -> bool:
     if gqa_layers is not None:
         return layer_idx in gqa_layers
     return (layer_idx + 1) % config.gqa_interval == 0
+
+
+def _use_amd_fused_kda(vllm_config: VllmConfig) -> bool:
+    # The fused projection/conv path does not implement speculative KDA state
+    # forking and accepted-state recovery. Keep the generic KDA path for
+    # speculative serving; target-only ROCm serving retains the fused path.
+    return rocm_aiter_ops.is_enabled() and vllm_config.speculative_config is None
 
 
 def _fused_qkv_view(q, k, v):
@@ -546,7 +555,7 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
 
         # ROCm/AITER fused input-projection + conv path. Off by default so other
         # vendors keep separate projections/convs and the two-kernel decode.
-        self.fused_path = rocm_aiter_ops.is_enabled()
+        self.fused_path = _use_amd_fused_kda(vllm_config)
         if self.fused_path:
             self._init_fused_projections(projection_size, prefix)
         else:
@@ -793,14 +802,27 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             # Profile/warmup dummy runs skip mamba-family metadata.
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
-        if attn_metadata_narrowed.spec_sequence_masks is not None:
+        spec_sequence_masks = attn_metadata_narrowed.spec_sequence_masks
+        if spec_sequence_masks is not None and self.fused_path:
             raise NotImplementedError(
-                "SolarOpen2 KDA does not support speculative decoding yet."
+                "SolarOpen2 fused KDA path does not support speculative decoding."
             )
         has_initial_state = attn_metadata_narrowed.has_initial_state
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
         non_spec_state_indices_tensor = (
             attn_metadata_narrowed.non_spec_state_indices_tensor
+        )
+        spec_token_indx = attn_metadata_narrowed.spec_token_indx
+        non_spec_token_indx = attn_metadata_narrowed.non_spec_token_indx
+        spec_state_indices_tensor = attn_metadata_narrowed.spec_state_indices_tensor
+        spec_query_start_loc = attn_metadata_narrowed.spec_query_start_loc
+        num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
+        num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
+        non_spec_committed_state_indices = (
+            attn_metadata_narrowed.non_spec_committed_state_indices
+        )
+        non_spec_num_accepted_tokens = (
+            attn_metadata_narrowed.non_spec_num_accepted_tokens
         )
         num_actual_tokens = attn_metadata_narrowed.num_actual_tokens
         constant_caches = self.kv_cache
@@ -817,108 +839,256 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
 
-        if self.fused_path:
-            q, k, v = self._fused_qkv_conv(
-                q_proj_states,
-                k_proj_states,
-                v_proj_states,
-                conv_state,
-                attn_metadata_narrowed,
-            )
-        else:
-            q, k, v = self._unfused_qkv_conv(
-                q_proj_states,
-                k_proj_states,
-                v_proj_states,
-                conv_state,
-                attn_metadata_narrowed,
+        # A speculative step leaves a request's state "rolled": the recurrent
+        # state after draft j sits in ladder block j and the conv window starts
+        # at column num_accepted - 1. Every non-speculative reader below assumes
+        # the canonical position, so fold the committed state back first. No-op
+        # when the request accepted exactly one token.
+        if (
+            non_spec_committed_state_indices is not None
+            and non_spec_num_accepted_tokens is not None
+            and non_spec_state_indices_tensor is not None
+        ):
+            blk0 = non_spec_state_indices_tensor
+            recurrent_state[blk0] = recurrent_state[non_spec_committed_state_indices]
+            # One shift covers q/k/v: they are channel slices of one block.
+            shift = (non_spec_num_accepted_tokens.long() - 1).clamp_(min=0)
+            state_len = conv_state.size(-1)
+            cols = (
+                shift.unsqueeze(1)
+                + torch.arange(state_len, device=conv_state.device).unsqueeze(0)
+            ).clamp_(max=state_len - 1)
+            window = conv_state[blk0]
+            conv_state[blk0] = window.gather(
+                2, cols.unsqueeze(1).expand(-1, window.size(1), -1)
             )
 
-        q, k, v = map(
-            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim), (q, k, v)
-        )
-
-        if attn_metadata_narrowed.num_prefills > 0:
-            if self.fused_path:
-                # The fused path carries RAW b logits; gate them here.
-                beta = beta.float().sigmoid()
-                if self.allow_neg_eigval:
-                    beta = beta * 2.0
-            assert non_spec_state_indices_tensor is not None
-            assert has_initial_state is not None
-            zero_idx = non_spec_state_indices_tensor[~has_initial_state]
-            recurrent_state[zero_idx] = 0
-            initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_kda_with_fused_gate(
-                q=q,
-                k=k,
-                v=v,
-                raw_g=g1,
-                beta=beta,
-                A_log=self.A_log,
-                g_bias=self.dt_bias,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
-            )
-            # Init cache
-            recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
-        elif self.fused_path:
-            # Decode: single fused gate+recurrent kernel. Pass RAW g1 (a) and RAW
-            # b logits; the kernel applies softplus/-exp(A_log) gating and
-            # sigmoid(b)[*2] internally. Decode tokens live at the front of the
-            # non-spec batch and are written straight into core_attn_out.
-            assert non_spec_query_start_loc is not None
-            n_dec = attn_metadata_narrowed.num_decodes
-            fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=rearrange(g1, "1 n h d -> n h d")[:n_dec],
-                b=beta[:, :n_dec],
-                dt_bias=self.dt_bias,
-                q=q[:, :n_dec],
-                k=k[:, :n_dec],
-                v=v[:, :n_dec],
-                initial_state=recurrent_state,
-                inplace_final_state=True,
-                cu_seqlens=non_spec_query_start_loc[: n_dec + 1],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
-                is_kda=True,
-                neg_eigval=self.allow_neg_eigval,
-                out=core_attn_out[:, :n_dec],
-            )
-            return
+        # Split the batch into the speculative part and the rest. q/k/v are
+        # (tokens, dim) while g1 is (1, tokens, h, d) and beta is (1, tokens, h),
+        # so they gather on different axes.
+        if spec_sequence_masks is not None:
+            if (
+                attn_metadata_narrowed.num_prefills == 0
+                and attn_metadata_narrowed.num_decodes == 0
+            ):
+                q_spec, k_spec, v_spec = q_proj_states, k_proj_states, v_proj_states
+                g1_spec, beta_spec = g1, beta
+                q_ns = k_ns = v_ns = g1_ns = beta_ns = None
+            else:
+                assert spec_token_indx is not None
+                assert non_spec_token_indx is not None
+                q_spec = q_proj_states.index_select(0, spec_token_indx)
+                k_spec = k_proj_states.index_select(0, spec_token_indx)
+                v_spec = v_proj_states.index_select(0, spec_token_indx)
+                g1_spec = g1.index_select(1, spec_token_indx)
+                beta_spec = beta.index_select(1, spec_token_indx)
+                q_ns = q_proj_states.index_select(0, non_spec_token_indx)
+                k_ns = k_proj_states.index_select(0, non_spec_token_indx)
+                v_ns = v_proj_states.index_select(0, non_spec_token_indx)
+                g1_ns = g1.index_select(1, non_spec_token_indx)
+                beta_ns = beta.index_select(1, non_spec_token_indx)
         else:
-            assert non_spec_query_start_loc is not None
-            g1 = fused_kda_gate(
-                rearrange(g1, "1 n h d -> n (h d)"),
+            q_spec = k_spec = v_spec = g1_spec = beta_spec = None
+            q_ns, k_ns, v_ns = q_proj_states, k_proj_states, v_proj_states
+            g1_ns, beta_ns = g1, beta
+
+        core_attn_out_spec = None
+        if spec_sequence_masks is not None:
+            assert spec_state_indices_tensor is not None
+            assert spec_query_start_loc is not None
+            assert q_spec is not None and k_spec is not None and v_spec is not None
+            assert g1_spec is not None and beta_spec is not None
+            q_spec, k_spec, v_spec = self._spec_qkv_conv(
+                q_spec, k_spec, v_spec, conv_state, attn_metadata_narrowed
+            )
+            q_spec, k_spec, v_spec = map(
+                lambda x: rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim),
+                (q_spec, k_spec, v_spec),
+            )
+            # fused_recurrent_kda takes a pre-gated g, while
+            # chunk_kda_with_fused_gate gates raw_g itself.
+            g1_spec = fused_kda_gate(
+                rearrange(g1_spec, "1 n h d -> n (h d)"),
                 self.A_log,
                 self.head_dim,
                 g_bias=self.dt_bias,
             ).unsqueeze(0)
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = fused_recurrent_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g1,
-                beta=beta,
+            core_attn_out_spec, _ = fused_recurrent_kda(
+                q=q_spec,
+                k=k_spec,
+                v=v_spec,
+                g=g1_spec,
+                beta=beta_spec,
                 initial_state=recurrent_state,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc[
-                    : attn_metadata_narrowed.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
+                cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
+                ssm_state_indices=spec_state_indices_tensor,
+                num_accepted_tokens=num_accepted_tokens,
             )
-        core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-            0, :num_actual_tokens
-        ]
+
+        core_attn_out_non_spec = None
+        if q_ns is not None:
+            assert k_ns is not None and v_ns is not None
+            assert g1_ns is not None and beta_ns is not None
+            if self.fused_path:
+                q, k, v = self._fused_qkv_conv(
+                    q_ns,
+                    k_ns,
+                    v_ns,
+                    conv_state,
+                    attn_metadata_narrowed,
+                )
+            else:
+                q, k, v = self._unfused_qkv_conv(
+                    q_ns,
+                    k_ns,
+                    v_ns,
+                    conv_state,
+                    attn_metadata_narrowed,
+                )
+
+            q, k, v = map(
+                lambda x: rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim),
+                (q, k, v),
+            )
+
+            if attn_metadata_narrowed.num_prefills > 0:
+                if self.fused_path:
+                    # The fused path carries RAW b logits; gate them here.
+                    beta_ns = beta_ns.float().sigmoid()
+                    if self.allow_neg_eigval:
+                        beta_ns = beta_ns * 2.0
+                assert non_spec_state_indices_tensor is not None
+                assert has_initial_state is not None
+                zero_idx = non_spec_state_indices_tensor[~has_initial_state]
+                recurrent_state[zero_idx] = 0
+                initial_state = recurrent_state[
+                    non_spec_state_indices_tensor
+                ].contiguous()
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = chunk_kda_with_fused_gate(
+                    q=q,
+                    k=k,
+                    v=v,
+                    raw_g=g1_ns,
+                    beta=beta_ns,
+                    A_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                )
+                # Init cache
+                recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+            elif self.fused_path:
+                # Decode: single fused gate+recurrent kernel. Pass RAW g1 (a) and
+                # RAW b logits; the kernel applies softplus/-exp(A_log) gating and
+                # sigmoid(b)[*2] internally. Decode tokens live at the front of
+                # the non-spec batch and are written straight into core_attn_out.
+                assert non_spec_query_start_loc is not None
+                n_dec = attn_metadata_narrowed.num_decodes
+                fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=rearrange(g1_ns, "1 n h d -> n h d")[:n_dec],
+                    b=beta_ns[:, :n_dec],
+                    dt_bias=self.dt_bias,
+                    q=q[:, :n_dec],
+                    k=k[:, :n_dec],
+                    v=v[:, :n_dec],
+                    initial_state=recurrent_state,
+                    inplace_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[: n_dec + 1],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=True,
+                    neg_eigval=self.allow_neg_eigval,
+                    out=core_attn_out[:, :n_dec],
+                )
+                return
+            else:
+                assert non_spec_query_start_loc is not None
+                g1_ns = fused_kda_gate(
+                    rearrange(g1_ns, "1 n h d -> n (h d)"),
+                    self.A_log,
+                    self.head_dim,
+                    g_bias=self.dt_bias,
+                ).unsqueeze(0)
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = fused_recurrent_kda(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g1_ns,
+                    beta=beta_ns,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc[
+                        : attn_metadata_narrowed.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                )
+
+        if core_attn_out_spec is not None and core_attn_out_non_spec is not None:
+            # Mixed batch: scatter both halves back to the batch's token order.
+            merged = torch.empty(
+                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
+                dtype=core_attn_out_spec.dtype,
+                device=core_attn_out_spec.device,
+            )
+            merged.index_copy_(1, spec_token_indx, core_attn_out_spec)
+            merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            core_attn_out[0, :num_actual_tokens] = merged[0, :num_actual_tokens]
+        elif core_attn_out_spec is not None:
+            core_attn_out[0, :num_actual_tokens] = core_attn_out_spec[
+                0, :num_actual_tokens
+            ]
+        else:
+            assert core_attn_out_non_spec is not None
+            core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
+                0, :num_actual_tokens
+            ]
+
+    def _spec_qkv_conv(
+        self,
+        q_proj_states: torch.Tensor,
+        k_proj_states: torch.Tensor,
+        v_proj_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor
+        assert spec_state_indices_tensor is not None
+        # The conv state lives in the first block of each request's ladder; the
+        # recurrent kernel takes the whole 2-D ladder instead.
+        conv_indices = spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes]
+        max_query_len = spec_state_indices_tensor.size(-1)
+        conv_state_q, conv_state_k, conv_state_v = conv_state.chunk(3, dim=-2)
+
+        def _conv(x, conv_state_chunk, conv1d):
+            return causal_conv1d_update(
+                x,
+                conv_state_chunk,
+                conv1d.weight.view(conv1d.weight.size(0), conv1d.weight.size(2)),
+                conv1d.bias,
+                activation="silu",
+                conv_state_indices=conv_indices,
+                num_accepted_tokens=attn_metadata.num_accepted_tokens,
+                query_start_loc=attn_metadata.spec_query_start_loc,
+                max_query_len=max_query_len,
+                # The speculative window is width - 1 + num_spec wide, which the
+                # kernel's own bounds check does not expect.
+                validate_data=False,
+            )
+
+        q = _conv(q_proj_states, conv_state_q, self.q_conv1d)
+        k = _conv(k_proj_states, conv_state_k, self.k_conv1d)
+        v = _conv(v_proj_states, conv_state_v, self.v_conv1d)
+        return q, k, v
 
     def _fused_qkv_conv(
         self,
@@ -1027,9 +1197,20 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             ).transpose(0, 1)
         else:
             assert non_spec_state_indices_tensor is not None
-            decode_conv_indices = non_spec_state_indices_tensor[
-                : attn_metadata_narrowed.num_actual_tokens
-            ]
+            num_decodes = attn_metadata_narrowed.num_decodes
+            # One block id per sequence, not per token.
+            decode_conv_indices = non_spec_state_indices_tensor[:num_decodes]
+            # Speculative decoding widens the reorder threshold to num_spec + 1,
+            # so a draft-free batch can still be a "decode" with several tokens
+            # per sequence (e.g. FULL cudagraph capture). The kernel infers its
+            # batch from x.shape[0] unless handed the sequence boundaries.
+            if q_proj_states.size(0) == num_decodes:
+                decode_query_start_loc = None
+                decode_max_query_len = -1
+            else:
+                assert non_spec_query_start_loc is not None
+                decode_query_start_loc = non_spec_query_start_loc[: num_decodes + 1]
+                decode_max_query_len = self.num_spec + 1
             q = causal_conv1d_update(
                 q_proj_states,
                 conv_state_q,
@@ -1037,6 +1218,8 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
                 self.q_conv1d.bias,
                 activation="silu",
                 conv_state_indices=decode_conv_indices,
+                query_start_loc=decode_query_start_loc,
+                max_query_len=decode_max_query_len,
                 validate_data=True,
             )
             k = causal_conv1d_update(
@@ -1046,6 +1229,8 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
                 self.k_conv1d.bias,
                 activation="silu",
                 conv_state_indices=decode_conv_indices,
+                query_start_loc=decode_query_start_loc,
+                max_query_len=decode_max_query_len,
                 validate_data=True,
             )
             v = causal_conv1d_update(
@@ -1055,6 +1240,8 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
                 self.v_conv1d.bias,
                 activation="silu",
                 conv_state_indices=decode_conv_indices,
+                query_start_loc=decode_query_start_loc,
+                max_query_len=decode_max_query_len,
                 validate_data=True,
             )
         return q, k, v
@@ -1154,12 +1341,13 @@ class SolarOpen2DecoderLayer(nn.Module):
         "inputs_embeds": 0,
     }
 )
-class SolarOpen2Model(nn.Module):
+class SolarOpen2Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.fused_kda_path = _use_amd_fused_kda(vllm_config)
 
         self.vocab_size = config.vocab_size
 
@@ -1203,7 +1391,7 @@ class SolarOpen2Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1215,8 +1403,15 @@ class SolarOpen2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1224,6 +1419,8 @@ class SolarOpen2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -1257,7 +1454,7 @@ class SolarOpen2Model(nn.Module):
         # ROCm/AITER fused KDA in_proj/conv1d routing. When off, KDA layers keep
         # separate projections/convs, which fall through to the default loaders
         # below (q/k/v via the qkv_shard_names skip, the rest as plain params).
-        fused_path = rocm_aiter_ops.is_enabled()
+        fused_path = self.fused_kda_path
         if fused_path:
             # q/k/v/b are standard merged shards (source narrowed by tp_rank);
             # f_a/g_a are DUPLICATED shards (full source broadcast to every rank's
@@ -1472,6 +1669,7 @@ class SolarOpen2ForCausalLM(
     HasInnerState,
     SupportsPP,
     SupportsLoRA,
+    SupportsEagle3,
     MixtureOfExperts,
     IsHybrid,
 ):
@@ -1580,7 +1778,7 @@ class SolarOpen2ForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
