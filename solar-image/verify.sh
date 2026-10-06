@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Runtime verification for the Solar 1-Oct (MXFP4 + FP8 router) image. Needs a
-# GPU: importing aiter.fused_moe calls get_gfx(), which shells out to rocminfo,
-# so none of this can run during `docker build`.
+# Runtime verification for the Solar v0.31.0 (MXFP4 + FP8 router) image. Needs
+# a GPU: importing aiter.fused_moe calls get_gfx(), which shells out to
+# rocminfo, so none of this can run during `docker build`.
 #
 #   docker run --rm --entrypoint verify-fused-router \
 #     --device=/dev/kfd --device=/dev/dri --group-add video \
-#     -e HIP_VISIBLE_DEVICES=0 vllm-solar:1001-fp8
+#     -e HIP_VISIBLE_DEVICES=0 vllm-solar:v031-fp8
 set -euo pipefail
 
 python3 - <<'PY'
@@ -46,6 +46,12 @@ print(f"arch_supported   {fused_moe_router_arch_supported()}")
 from vllm._aiter_ops import rocm_aiter_ops
 print(f"has_fused_moe_router()     {rocm_aiter_ops.has_fused_moe_router()}")
 print(f"is_fused_router_enabled()  {rocm_aiter_ops.is_fused_router_enabled()}")
+
+# Model Runner V2 rejects SolarOpen2TemplateLogitsProcessor at startup.
+import vllm.envs as envs
+print(f"VLLM_USE_V2_MODEL_RUNNER   {envs.VLLM_USE_V2_MODEL_RUNNER}")
+assert envs.VLLM_USE_V2_MODEL_RUNNER is False, \
+    "VLLM_USE_V2_MODEL_RUNNER must be 0 for the Solar logits processor"
 
 # The Solar-Open2 decode shapes: bf16 in, MXFP4 or FP8 per-token experts.
 from aiter import ActivationType, QuantType, dtypes

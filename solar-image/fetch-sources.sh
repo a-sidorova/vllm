@@ -2,35 +2,39 @@
 # Regenerate the two source trees the Dockerfile consumes, from git pins.
 #
 #   vllm-src/       engine branch, exported with `git archive`
-#   aiter-overlay/  the six router files, exported from the public aiter branch
+#   aiter-overlay/  the nine router files, exported from the public aiter branch
 #
 # Both are pinned by commit and checked against recorded md5s, so a re-run on
 # another host produces byte-identical inputs or fails loudly.
 #
-#   ./fetch-sources.sh && docker build -t vllm-solar:1001-fp8 .
+#   ./fetch-sources.sh && docker build -t vllm-solar:v031-fp8 .
 set -euo pipefail
 cd "$(dirname "$0")"
 
 # --- pins ------------------------------------------------------------------
 VLLM_REMOTE=https://github.com/UpstageAI/upstage-vllm-amd
-VLLM_REF=asidorov/features/solar_35b_fp8_model_optimizations
-# The FP8 fused-router engine commit. The branch tip may carry later changes to
-# this directory only; the image is built from this commit.
-VLLM_COMMIT=d8cde836bdf5dd787ff97fe6a30f49468d8aa29d
+VLLM_REF=asidorov/port/solar-v0.31.0
+# The v0.31.0 port with the FP8 fused-router engine commit. The branch tip may
+# carry later changes to this directory only; the image is built from this
+# commit.
+VLLM_COMMIT=d05acb0848cf8469657b6e3a44bb6903010d2cfd
 
 AITER_REMOTE=https://github.com/sshlyapn/aiter.git
-AITER_REF=asidorov/features/fused_router_fp8
-AITER_COMMIT=adcfd7630f0aa07358d35aa2528f506ae411321c
+AITER_REF=sshliapn/feature/fused_router_0.1.23
+AITER_COMMIT=9689185d39545469e0f0ea83c4c342b8a94723b5
 
-# The overlay, and the md5 each file must have at $AITER_COMMIT. __init__.py and
-# optCompilerConfig.json are unchanged from the MXFP4-only image (7fb161ea1).
+# The overlay, and the md5 each file must have at $AITER_COMMIT: every file the
+# router commits touch on top of v0.1.23, except tests and CI.
 OVERLAY_FILES=(
-  "aiter/fused_moe.py:66abdfd775aadbb45f212ed3a31c0d08"
-  "aiter/__init__.py:c67a8d22d27beed0d671e4bbee71e71c"
-  "aiter/ops/fused_moe_router.py:33d9b4933fee9c92685778242759d3cd"
-  "aiter/jit/optCompilerConfig.json:d104a47acd966c3c78b984ba488c9fa5"
-  "csrc/kernels/fused_moe_router.cu:84d05cbeaf8cef5c00e64c60064c8933"
-  "csrc/py_itfs_cu/fused_moe_router_entry.cu:3d476801335301c2d5c2eec8a69d4e1e"
+  "aiter/fused_moe.py:9a894f77b047c2454fe110badbfc19da"
+  "aiter/__init__.py:0d51cd0f9ee13174c19ba911c9252c2a"
+  "aiter/ops/fused_moe_router.py:7e507b9e99ca4c3527b57a62af9ccec6"
+  "aiter/jit/optCompilerConfig.json:3a2c1f80bb5f3832bd9944ce33e78024"
+  "csrc/include/aiter_hip_common.h:44c35ddad906e4d50543d0ee2c32a819"
+  "csrc/include/fused_moe_router.h:f13612d37206953b6698235d8e2fa9a9"
+  "csrc/include/rocm_ops.hpp:fd1226385e80344a97a5770d68d42dc2"
+  "csrc/kernels/fused_moe_router.cu:1d28617ff78d9c0e6e45704a459ad7e8"
+  "csrc/pybind/fused_moe_router_pybind.cu:023dcc6c219d4ea9942edea0c6d6947b"
 )
 
 # --- engine ----------------------------------------------------------------
@@ -115,4 +119,4 @@ for entry in "${TUNING_FILES[@]}"; do
 done
 
 echo
-echo "Sources ready. Next:  docker build -t vllm-solar:1001-fp8 ."
+echo "Sources ready. Next:  docker build -t vllm-solar:v031-fp8 ."

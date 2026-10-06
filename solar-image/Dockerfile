@@ -1,25 +1,25 @@
-# Solar-Open2 "1 Oct" image: the 8 Sep combined image plus the fused MoE router
-# for FP8 per-token experts (Solar-Open2-35B FP8, Quark PTPC).
+# Solar-Open2 v0.31.0 image: the Solar-Open2 port onto vLLM v0.31.0 plus the
+# fused MoE router for MXFP4 and FP8 per-token experts.
 #
-# Base: stock vllm/vllm-openai-rocm:v0.25.1. AITER and flydsl are NOT replaced -
-# the router is injected as a six-file overlay onto the AITER the image already
-# ships (amd-aiter 0.1.16.post2 / flydsl 0.2.0, both untouched).
+# Base: stock vllm/vllm-openai-rocm:v0.31.0. AITER and flydsl are NOT replaced -
+# the router is injected as a nine-file overlay onto the AITER the image already
+# ships (amd-aiter 0.1.23 / flydsl 0.3.4.1, both untouched).
 #
-#   engine  asidorov/features/solar_35b_fp8_model_optimizations
-#           d8cde836bdf5dd787ff97fe6a30f49468d8aa29d  (v0.25.1 + 22 commits)
-#   router  ROCm/aiter#5150 + FP8 per-token mode, sshlyapn/aiter
-#           asidorov/features/fused_router_fp8 @ adcfd7630
+#   engine  asidorov/port/solar-v0.31.0
+#           d05acb0848cf8469657b6e3a44bb6903010d2cfd  (v0.31.0 + 19 commits)
+#   router  ROCm/aiter#5150 + hidden 2048 + FP8 per-token mode, sshlyapn/aiter
+#           sshliapn/feature/fused_router_0.1.23 @ 9689185d3 (on v0.1.23)
 #
 # One image serves the MXFP4 (35B, 250B) and FP8 (35B) checkpoints; only the
 # launch arguments differ.
 #
 # Build:
 #   ./fetch-sources.sh          # regenerates vllm-src/ and aiter-overlay/
-#   docker build -t vllm-solar:1001-fp8 .
+#   docker build -t vllm-solar:v031-fp8 .
 
-# Pinned by digest, not tag: a re-pushed v0.25.1 would otherwise change the
-# image silently. This digest is v0.25.1 as of 2026-09-17 (b0f090658a8d).
-FROM vllm/vllm-openai-rocm:v0.25.1@sha256:84459732ca98b40fe2f5338a3f050be6d522504e47a484a5180d58fb75956f86
+# Pinned by digest, not tag: a re-pushed v0.31.0 would otherwise change the
+# image silently. This digest is v0.31.0 as of 2026-10-04.
+FROM vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
 
 ARG PYTHON_VERSION=3.12
 ARG SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/dist-packages
@@ -32,22 +32,32 @@ ARG SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/dist-packages
 # so the override would be silently ignored and you would get a 9-arch build.
 ARG SOLAR_ROCM_ARCH=gfx950
 
-# The source is exported with `git archive`, so there is no .git for
-# setuptools_scm to read. v0.25.1 + 22 commits, hence 0.25.2.dev22.
-ARG VLLM_VERSION=0.25.2.dev22+gd8cde836bd
-
 # ---------------------------------------------------------------------------
-# 1. vLLM: rebuild _rocm_C for the wvSplitK out-of-bounds fix (a54bf82717,
+# 1. vLLM: rebuild _rocm_C for the wvSplitK out-of-bounds fix (f40c0bee45,
 #    csrc/rocm/skinny_gemms.cu). It is the only non-Python change on the
 #    branch, and the only reason a compile is needed at all.
+#
+#    Only the _rocm_C target is built, straight through CMake. `setup.py
+#    build_ext` would build every extension and, since v0.31, also runs
+#    setuptools-rust, which has no toolchain in the image. TRITON_KERNELS_SRC_DIR
+#    points at the image's copy so configure does not clone ROCm/triton; the
+#    sources are untracked in git, so `git archive` does not carry them.
 # ---------------------------------------------------------------------------
 COPY vllm-src/ /vllm_src/
 RUN set -eu; \
-    cd /vllm_src; \
-    PYTORCH_ROCM_ARCH=${SOLAR_ROCM_ARCH} MAX_JOBS=$(nproc) \
-    SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_VERSION} \
-        python3 setup.py build_ext --inplace; \
-    cp vllm/_rocm_C.abi3.so ${SITE_PACKAGES}/vllm/_rocm_C.abi3.so
+    mkdir /tmp/rocmc_build; \
+    cd /tmp/rocmc_build; \
+    PYTORCH_ROCM_ARCH=${SOLAR_ROCM_ARCH} \
+    TRITON_KERNELS_SRC_DIR=${SITE_PACKAGES}/vllm/third_party/triton_kernels \
+        cmake /vllm_src -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DVLLM_TARGET_DEVICE=rocm \
+            -DVLLM_PYTHON_EXECUTABLE=$(which python3) \
+            -DROCM_PATH=/opt/rocm; \
+    cmake --build . --target _rocm_C -j $(nproc); \
+    cp _rocm_C.abi3.so ${SITE_PACKAGES}/vllm/_rocm_C.abi3.so; \
+    cd /; \
+    rm -rf /tmp/rocmc_build
 
 # ---------------------------------------------------------------------------
 # 2. vLLM Python drop-in. The source tree has no _rust_tool_parser.abi3.so
@@ -59,20 +69,17 @@ RUN set -eu; \
     rm -rf /vllm_src
 
 # ---------------------------------------------------------------------------
-# 3. AITER fused router (aiter#5150 + FP8 per-token), overlay-style. The
-#    branch sits on exactly the revision the image ships (base 620287969) -
-#    fused_moe.py, __init__.py and optCompilerConfig.json all md5-match the
-#    installed copies before the router commits - so no AITER reinstall and no
-#    flydsl bump.
+# 3. AITER fused router (aiter#5150 + hidden 2048 + FP8 per-token),
+#    overlay-style. The branch sits on exactly the revision the image ships
+#    (v0.1.23, 50da036ac) - the five files it modifies all md5-match the
+#    installed copies at that tag - so no AITER reinstall and no flydsl bump.
 #
-#    Kernels go to aiter_meta/, where AITER_CSRC_DIR points; the build registry
-#    lives in the package tree. module_fused_moe_router JITs on first use.
+#    Sources and headers go to aiter_meta/csrc/, where AITER_CSRC_DIR points;
+#    the build registry lives in the package tree. module_fused_moe_router
+#    JITs on first use unless step 5 compiles it.
 # ---------------------------------------------------------------------------
 COPY aiter-overlay/aiter/ ${SITE_PACKAGES}/aiter/
-COPY aiter-overlay/csrc/kernels/fused_moe_router.cu \
-     ${SITE_PACKAGES}/aiter_meta/csrc/kernels/
-COPY aiter-overlay/csrc/py_itfs_cu/fused_moe_router_entry.cu \
-     ${SITE_PACKAGES}/aiter_meta/csrc/py_itfs_cu/
+COPY aiter-overlay/csrc/ ${SITE_PACKAGES}/aiter_meta/csrc/
 RUN find ${SITE_PACKAGES}/aiter -name '__pycache__' -type d -exec rm -rf {} +
 
 # ---------------------------------------------------------------------------
@@ -93,14 +100,16 @@ RUN set -eu; \
     test -f ${SITE_PACKAGES}/vllm/model_executor/models/solar_open2.py; \
     test -f ${SITE_PACKAGES}/aiter/ops/fused_moe_router.py; \
     test -f ${SITE_PACKAGES}/aiter_meta/csrc/kernels/fused_moe_router.cu; \
-    test -f ${SITE_PACKAGES}/aiter_meta/csrc/py_itfs_cu/fused_moe_router_entry.cu; \
+    test -f ${SITE_PACKAGES}/aiter_meta/csrc/pybind/fused_moe_router_pybind.cu; \
+    test -f ${SITE_PACKAGES}/aiter_meta/csrc/include/fused_moe_router.h; \
+    grep -q 'fused_moe_router' ${SITE_PACKAGES}/aiter_meta/csrc/include/rocm_ops.hpp; \
     python3 -c "import json,sys; d=json.load(open('${SITE_PACKAGES}/aiter/jit/optCompilerConfig.json')); sys.exit(0 if 'module_fused_moe_router' in d else 1)"; \
-    python3 -c "import importlib.metadata as m; assert m.version('flydsl')=='0.2.0', m.version('flydsl')"; \
-    python3 -c "import importlib.metadata as m; assert m.version('amd-aiter')=='0.1.16.post2', m.version('amd-aiter')"; \
+    python3 -c "import importlib.metadata as m; assert m.version('flydsl')=='0.3.4.1', m.version('flydsl')"; \
+    python3 -c "import importlib.metadata as m; assert m.version('amd-aiter')=='0.1.23', m.version('amd-aiter')"; \
     grep -q 'def fused_moe_router_config_supported' ${SITE_PACKAGES}/aiter/fused_moe.py; \
     grep -q 'shared_expert_weight' ${SITE_PACKAGES}/aiter/fused_moe.py; \
     grep -qF '(QuantType.per_Token, dtypes.fp8): dtypes.fp8' ${SITE_PACKAGES}/aiter/fused_moe.py; \
-    grep -q 'QuantType::per_Token' ${SITE_PACKAGES}/aiter_meta/csrc/py_itfs_cu/fused_moe_router_entry.cu; \
+    grep -q 'QuantType::per_Token' ${SITE_PACKAGES}/aiter_meta/csrc/kernels/fused_moe_router.cu; \
     grep -q 'AiterFusedRouterExperts' ${SITE_PACKAGES}/vllm/model_executor/layers/fused_moe/experts/rocm_aiter_moe.py; \
     grep -q 'def _rocm_aiter_fused_router_quant_method' ${SITE_PACKAGES}/vllm/model_executor/layers/fused_moe/experts/rocm_aiter_moe.py; \
     grep -q 'AiterFusedRouterExperts' ${SITE_PACKAGES}/vllm/model_executor/layers/fused_moe/oracle/fp8.py; \
@@ -141,13 +150,18 @@ ENV AITER_CONFIG_GEMM_A8W8=/tuning/a8w8_tuned_gemm_35b_fp8.csv
 ENV VLLM_ROCM_USE_AITER=1
 ENV VLLM_ROCM_USE_AITER_FUSED_ROUTER=1
 
+# v0.31.0 defaults to Model Runner V2, which rejects the V1-interface
+# SolarOpen2TemplateLogitsProcessor the FP8 and 250B launches pass.
+ENV VLLM_USE_V2_MODEL_RUNNER=0
+
 RUN printf '%s\n' \
-    'engine: asidorov/features/solar_35b_fp8_model_optimizations @ d8cde836bd' \
-    'router: ROCm/aiter#5150 + FP8 per-token (adcfd7630) overlay on amd-aiter 0.1.16.post2 (flydsl 0.2.0)' \
+    'engine: asidorov/port/solar-v0.31.0 @ d05acb0848 (v0.31.0 + 19 commits)' \
+    'router: ROCm/aiter#5150 + hidden 2048 + FP8 per-token (9689185d3) overlay on amd-aiter 0.1.23 (flydsl 0.3.4.1)' \
     'PYTORCH_ROCM_ARCH: gfx950' \
     'AITER_CONFIG_FMOE: /tuning/fmoe_tuned_solar.csv (MXFP4 80+81 expert, FP8 128 expert)' \
     'AITER_CONFIG_GEMM_BF16: /tuning/aiter_gemm_tuning.csv' \
     'AITER_CONFIG_GEMM_A8W8: /tuning/a8w8_tuned_gemm_35b_fp8.csv (compiled into module_gemm_a8w8.so)' \
+    'VLLM_USE_V2_MODEL_RUNNER: 0' \
     >> /app/versions.txt
 
 # ---------------------------------------------------------------------------

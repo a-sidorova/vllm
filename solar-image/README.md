@@ -1,4 +1,4 @@
-# Solar-Open2 (MXFP4 + FP8) — "1 Oct" fused-router image
+# Solar-Open2 (MXFP4 + FP8) — v0.31.0 fused-router image
 
 vLLM ROCm image for Solar-Open2 on MI355X:
 
@@ -7,9 +7,10 @@ vLLM ROCm image for Solar-Open2 on MI355X:
 > per-token** experts + tuned decode MXFP4 MoE + tuned FP8 35B MoE and a8w8
 > GEMMs.
 
-The "8 Sep combined" image (`vllm-solar:0908-combined`, the image behind
-`SOLAR_35B_MXFP4_TP1_MI355X_reference.html`) plus the FP8 router: aiter
-`adcfd7630` and engine `d8cde836bd`, one commit on each side.
+The "1 Oct" image (`vllm-solar:1001-fp8`, v0.25.1-based) moved onto vLLM
+v0.31.0: the Solar-Open2 series ported to `asidorov/port/solar-v0.31.0`
+(`d05acb0848`), and the router rebased onto AITER v0.1.23 (`9689185d3`), the
+AITER the v0.31.0 image ships.
 
 One image serves all three checkpoints; only the launch arguments differ. The
 35B MXFP4 runs TP1 (the reference report); the 35B FP8 runs TP1 (§Run); the
@@ -22,34 +23,35 @@ Self-contained: engine, router kernel and tuning are all in the image.
 
 | | Value |
 |---|---|
-| Base image | `vllm/vllm-openai-rocm:v0.25.1`, pinned by digest `sha256:84459732…` |
-| Engine | `asidorov/features/solar_35b_fp8_model_optimizations` @ `d8cde836bd` (`8665505227` + this directory + the FP8 router commit) |
+| Base image | `vllm/vllm-openai-rocm:v0.31.0`, pinned by digest `sha256:749f6f3f…` |
+| Engine | `asidorov/port/solar-v0.31.0` @ `d05acb0848` (`v0.31.0` + 19 commits: the Solar-Open2 series, the fused router, this directory) |
 | Engine remote | `github.com/UpstageAI/upstage-vllm-amd` (**private**) |
-| Router | ROCm/aiter#5150 + FP8 per-token mode @ `adcfd7630` (on top of `7fb161ea1`, the 8 Sep router) |
-| Router remote | `github.com/sshlyapn/aiter`, branch `asidorov/features/fused_router_fp8` |
+| Router | ROCm/aiter#5150 + hidden 2048 + FP8 per-token mode @ `9689185d3` (4 commits on `v0.1.23`, `50da036ac`) |
+| Router remote | `github.com/sshlyapn/aiter`, branch `sshliapn/feature/fused_router_0.1.23` |
 | Target arch | `gfx950` (MI355X only) |
-| AITER / flydsl | `0.1.16.post2` / `0.2.0` — both untouched |
+| AITER / flydsl | `0.1.23` / `0.3.4.1` — both untouched |
 
 ## Build
 
 Requires: Docker and a ROCm host. No GPU needed.
 
 ```bash
-git clone -b asidorov/features/solar_35b_fp8_model_optimizations \
+git clone -b asidorov/port/solar-v0.31.0 \
     https://github.com/UpstageAI/upstage-vllm-amd
 cd upstage-vllm-amd/solar-image
 ./fetch-sources.sh
-docker build -t vllm-solar:1001-fp8 .
+docker build -t vllm-solar:v031-fp8 .
 ```
 
 Do not `--depth 1` the clone: `fetch-sources.sh` exports the engine from
-`d8cde836bd` in your own checkout, so a full clone needs no network at all. On
+`d05acb0848` in your own checkout, so a full clone needs no network at all. On
 a shallow clone it falls back to fetching that commit from the remote.
 
-Takes ~15 min: ~10 for `skinny_gemms.hip.o`, ~3.5 for `module_gemm_a8w8`,
-~35 s for the router.
+Outside Docker on a 256-core host: ~4 min for `_rocm_C`, ~35 s for the router,
+and 4–12 min for `module_gemm_a8w8` (209 s alone on v0.25.1; 686 s on 0.1.23
+while sharing the host with the `_rocm_C` build).
 
-`fetch-sources.sh` pins both revisions by commit and md5-checks all six router
+`fetch-sources.sh` pins both revisions by commit and md5-checks all nine router
 files and the four tuning CSVs, so it either reproduces the exact intended
 inputs or fails loudly.
 
@@ -62,18 +64,19 @@ GPU="--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host
      --shm-size 16G -e HIP_VISIBLE_DEVICES=0"
 
 # 1. Is the image assembled correctly?
-docker run --rm $GPU --entrypoint verify-fused-router vllm-solar:1001-fp8
+docker run --rm $GPU --entrypoint verify-fused-router vllm-solar:v031-fp8
 
 # 2. Does the kernel actually run?
 docker run --rm $GPU --entrypoint bash \
   -v "$PWD/router_smoke.py:/tmp/rs.py:ro" \
-  vllm-solar:1001-fp8 -lc 'python3 /tmp/rs.py'
+  vllm-solar:v031-fp8 -lc 'python3 /tmp/rs.py'
 ```
 
 Check (1) launches nothing. It asserts:
 
 - the overlay landed, and every kwarg `vllm/_aiter_ops.py` forwards exists on
   `fused_moe_router`;
+- `VLLM_USE_V2_MODEL_RUNNER` resolves to off (see §Run);
 - the router accepts MXFP4 and FP8 per-token at hidden 2048/4096, with and
   without a fused shared expert, and refuses hidden 1024 and MXFP8;
 - the FP8 engine path is present: the FP8 oracle offers
@@ -93,6 +96,17 @@ means the router was not compiled into the image.
 `VLLM_ROCM_USE_AITER=1` and `VLLM_ROCM_USE_AITER_FUSED_ROUTER=1` are baked in;
 the router needs both.
 
+`VLLM_USE_V2_MODEL_RUNNER=0` is baked in too. v0.31.0 defaults to Model Runner
+V2, which refuses to start with `SolarOpen2TemplateLogitsProcessor` (a V1
+interface logits processor). Do not override it while passing
+`--logits-processors`.
+
+Shared-expert fusion stays opt-in
+(`-e VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1`). It only applies when the
+checkpoint quantizes the shared expert like the routed ones
+(`Solar-Open2-250B-mxfp4-shared-expert`); on the other checkpoints Quark
+excludes the shared expert and the fusion is declined per layer.
+
 ### 35B MXFP4, TP1 — the configuration the reference report measures
 
 ```bash
@@ -104,7 +118,7 @@ docker run --rm -it \
   -e VLLM_ROCM_USE_AITER_MOE=1 \
   -e VLLM_ROCM_USE_AITER_LINEAR=1 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-  vllm-solar:1001-fp8 \
+  vllm-solar:v031-fp8 \
   /models/solar-35b \
   --host 0.0.0.0 --port 8000 \
   --trust-remote-code --quantization=quark \
@@ -136,7 +150,7 @@ docker run --rm -it \
   -e VLLM_ROCM_USE_AITER_MOE=1 \
   -e VLLM_ROCM_USE_AITER_LINEAR=1 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-  vllm-solar:1001-fp8 \
+  vllm-solar:v031-fp8 \
   /models/solar-35b-fp8 \
   --host 0.0.0.0 --port 8000 \
   --trust-remote-code --quantization=quark \
@@ -168,7 +182,7 @@ docker run --rm -it \
   -e VLLM_ROCM_USE_AITER_LINEAR=1 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
-  vllm-solar:1001-fp8 \
+  vllm-solar:v031-fp8 \
   /models/Solar-Open2-250B-mxfp4 \
   --host 0.0.0.0 --port 8000 \
   --trust-remote-code --quantization quark \
@@ -241,52 +255,51 @@ prefills.
 | `verify.sh` | baked in as `verify-fused-router` | after build, GPU |
 | `router_smoke.py` | real kernel launches, MXFP4 and FP8 | after build, GPU |
 
-`vllm-src/` (93 MB) and `aiter-overlay/` (280 KB) are generated by
-`fetch-sources.sh`. Neither should be committed.
+`vllm-src/` and `aiter-overlay/` are generated by `fetch-sources.sh`. Neither
+should be committed.
 
 ## How it works
 
-**Engine (steps 1–2).** The branch is `v0.25.1` + 22 commits, and its only
-non-Python file is `csrc/rocm/skinny_gemms.cu` (wvSplitK out-of-bounds fix).
-That one file is the entire reason a compile happens. `build_ext` rebuilds all
-33 HIP objects and 4 modules, but only `_rocm_C.abi3.so` is copied into
-site-packages, since `skinny_gemms.cu` lands in that module alone.
+**Engine (steps 1–2).** The branch is `v0.31.0` + 19 commits, and its only
+non-Python file is `csrc/rocm/skinny_gemms.cu` (wvSplitK out-of-bounds fix,
+`f40c0bee45`; stock v0.31.0 does not carry it). That one file is the entire
+reason a compile happens. Step 1 configures the tree with CMake and builds the
+`_rocm_C` target alone, since `skinny_gemms.cu` lands in that module only; the
+result (~130 MB, gfx950) replaces the image's copy. The Python tree is then
+copied over the installed package. The archive carries no `_version.py`, so
+the image's copy stays and vLLM keeps reporting `0.31.0+rocm723`.
 
-The FP8 commit (`d8cde836bd`) is Python only. It maps Quark FP8 PTPC to the
-router in `rocm_aiter_moe.py`, has `oracle/fp8.py` offer
+The FP8 router commit (`bd2603f7e7`) is Python only. It maps Quark FP8 PTPC to
+the router in `rocm_aiter_moe.py`, has `oracle/fp8.py` offer
 `AiterFusedRouterExperts` first when the flag is on, as the MXFP4 oracle does,
-and adds `QuarkW8A8Fp8MoEMethod.apply_monolithic`. The same commit sits on
-`sshliapn/features/fused_router_fp8` as `e2330b3615`; that branch adds only
-KV-connector / MORI changes this image does not need.
+and adds `QuarkW8A8Fp8MoEMethod.apply_monolithic`.
 
-**Router (step 3).** Injected as six files rather than by reinstalling AITER.
+**Router (step 3).** Injected as nine files rather than by reinstalling AITER.
 This is safe because the branch sits on exactly the AITER revision the image
-ships: base `620287969`, then the MXFP4 router (`25979546b`), hidden 2048
-(`7fb161ea1`) and the FP8 mode (`adcfd7630`). Before the router commits,
-`fused_moe.py`, `__init__.py` and `optCompilerConfig.json` all md5-match the
-installed copies. So no AITER drift and no flydsl bump. The alternative
-branches are based on `v0.1.21`/`v0.1.22` and pin flydsl 0.3.2, which would
-mean replacing both packages wholesale.
+ships: `v0.1.23` (`50da036ac`), then the MXFP4 router (`6e84d85e2`), hidden
+2048 (`25c12fea1`), the FP8 mode (`331970f9e`) and the sort-extent padding fix
+(`9689185d3`). The five files the commits modify all md5-match the installed
+copies at `v0.1.23`; the other four are new. So no AITER drift and no flydsl
+bump.
 
-The FP8 mode changes four of the six files. `__init__.py` and
-`optCompilerConfig.json` are byte-identical to the 8 Sep image, so the
-module name and its sources are unchanged: the FP8 kernels are extra
-instantiations in the same translation unit.
-
-Files land in two trees because AITER resolves kernel sources from
+Files land in two trees because AITER resolves kernel sources and headers from
 `aiter_meta/` (a *sibling* of `aiter/`) but reads the build registry from the
 package:
 
 ```
 aiter/fused_moe.py, aiter/__init__.py,
 aiter/ops/fused_moe_router.py,
-aiter/jit/optCompilerConfig.json             -> package  (105 -> 106 modules)
+aiter/jit/optCompilerConfig.json             -> package
 csrc/kernels/fused_moe_router.cu,
-csrc/py_itfs_cu/fused_moe_router_entry.cu    -> aiter_meta
+csrc/pybind/fused_moe_router_pybind.cu,
+csrc/include/fused_moe_router.h,
+csrc/include/rocm_ops.hpp,
+csrc/include/aiter_hip_common.h              -> aiter_meta
 ```
 
-The `.cu` files are one translation unit — the entry `#include`s the kernel —
-so registering only the entry in `srcs` is correct.
+`module_fused_moe_router` compiles the pybind file and the kernel file. The two
+shared headers only gain router declarations; modules the base image already
+ships are not rebuilt.
 
 **FP8 data path.** In FP8 mode the router's phase 1 reproduces
 `dynamic_per_token_scaled_quant_kernel` and writes a token-indexed `[M, K]`
@@ -315,15 +328,20 @@ import-time device probe would break the build loudly, which is the right
 failure mode. `GPU_ARCHS=gfx950` also fixes the a8w8 codegen's build target at
 `cu_num` 256, which is what the tuned table is keyed on.
 
-## Two traps this Dockerfile works around
+## Three traps this Dockerfile works around
 
 1. **`PYTORCH_ROCM_ARCH` cannot be an ARG here.** The base image sets it as an
    `ENV` (the full 9-arch list), and ENV beats a same-named ARG during
    expansion — the override is silently ignored and you get a 9-arch build that
    takes ~9x longer. The ARG is named `SOLAR_ROCM_ARCH` for this reason.
-2. **`setuptools_scm` has no `.git`.** Sources are exported with `git archive`,
-   so the version must be pinned via `SETUPTOOLS_SCM_PRETEND_VERSION` or
-   `setup.py` aborts.
+2. **`setup.py build_ext` is not used.** Since v0.31 `setup.py` pulls in
+   setuptools-rust, and without `.git` it also needs a pinned
+   `setuptools_scm` version. Building only the `_rocm_C` CMake target avoids
+   both, and skips the extensions the image already ships.
+3. **`triton_kernels` is untracked.** `git archive` does not export
+   `vllm/third_party/triton_kernels`, so CMake configure would clone
+   ROCm/triton. `TRITON_KERNELS_SRC_DIR` points it at the image's installed
+   copy instead.
 
 ## Rebuilding the C++ extension later
 
@@ -332,23 +350,25 @@ the vLLM C++ sources — step 2 deletes `/vllm_src`. Mount them back:
 
 ```bash
 docker run --rm -v "$PWD/vllm-src:/src:ro" --entrypoint bash \
-  vllm-solar:1001-fp8 -lc '
-    cp -r /src /w && cd /w
-    PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=$(nproc) \
-    SETUPTOOLS_SCM_PRETEND_VERSION=0.25.2.dev22+gd8cde836bd \
-      python3 setup.py build_ext --inplace'
+  vllm-solar:v031-fp8 -lc '
+    SP=/usr/local/lib/python3.12/dist-packages
+    mkdir /b && cd /b
+    PYTORCH_ROCM_ARCH=gfx950 \
+    TRITON_KERNELS_SRC_DIR=$SP/vllm/third_party/triton_kernels \
+      cmake /src -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DVLLM_TARGET_DEVICE=rocm -DVLLM_PYTHON_EXECUTABLE=$(which python3) \
+        -DROCM_PATH=/opt/rocm
+    cmake --build . --target _rocm_C -j $(nproc)'
 ```
 
-Produces a 91 MB gfx950 `_rocm_C.abi3.so`, no GPU needed. `build_rust` fails at
-the end with `can't find Rust compiler` — harmless, it runs after the C++ work
-and the image already ships `_rust_tool_parser.abi3.so`. Compiling the `.cu` by
-hand with `hipcc` fails on `torch/all.h` unless you add
-`torch/include/torch/csrc/api/include`; let `setup.py` assemble the flags.
+Produces a ~130 MB gfx950 `_rocm_C.abi3.so` in `/b`, no GPU needed. Compiling
+the `.cu` by hand with `hipcc` fails on `torch/all.h` unless you add
+`torch/include/torch/csrc/api/include`; let CMake assemble the flags.
 
 ## Reproducibility
 
 Every input is pinned: both sources by commit, the base image by digest, the
-six router files and four tuning CSVs md5-checked.
+nine router files and four tuning CSVs md5-checked.
 
 Compiled *outputs* are not bit-reproducible — the HIP compiler is
 nondeterministic. Two builds of the 8 Sep image from identical sources produced
@@ -357,28 +377,37 @@ Judge these artifacts by behaviour, not by hash.
 
 ## Status
 
-Not built as an image yet. Each step was run outside Docker, on a host
-running the same base image with the same AITER and engine revisions:
+Not built as an image yet. Each step was run outside Docker, in a container
+of the same `v0.31.0` base image (same `/app/versions.txt`) with the same
+AITER and engine revisions:
 
-- `fetch-sources.sh` resolves both pins, and all six overlay md5s and four
-  tuning md5s match.
-- The step-4 FP8 checks pass on `d8cde836bd`. The `apply_monolithic` check
-  correctly rejects the MXFP4-only engine `8665505227`.
-- `tuning_check.py` passes. The merged fmoe table is the two source tables
-  byte for byte (52 rows).
+- `fetch-sources.sh` resolves both pins, and all nine overlay md5s and four
+  tuning md5s match. The five modified overlay files' stock copies match
+  `v0.1.23` byte for byte.
+- Step 1 as written, on the exported `vllm-src/` with `TRITON_KERNELS_SRC_DIR`
+  set to the wheel's copy: configure needs no network and `_rocm_C` builds in
+  3 min 43 s (131 MB, gfx950).
+- The step-4 checks pass against the overlaid AITER 0.1.23 and `d05acb0848`.
+- `tuning_check.py` passes against AITER 0.1.23's stock schemas; the merged
+  fmoe table is 52 rows. 0.1.23 reads the extra `gfx`/`xbf16`/`flat` columns.
 - `build_kernel.py module_fused_moe_router module_gemm_a8w8` with
-  `GPU_ARCHS=gfx950` builds the router in 34 s (3.6 MB, MXFP4 + FP8) and
-  `module_gemm_a8w8` in 209 s, with exactly 379 tuned shapes in the lookup
-  header.
-- `verify.sh` passes on gfx950 against those modules.
-- `router_smoke.py` passes both shapes. The FP8 launch takes the tuned 1-stage
-  row from the merged table.
+  `GPU_ARCHS=gfx950` builds the router in 34 s (7.2 MB, MXFP4 + FP8) and
+  `module_gemm_a8w8` with exactly 379 tuned shapes in the lookup header.
+- `verify.sh` passes on gfx950 against those modules, and fails as intended
+  without `VLLM_USE_V2_MODEL_RUNNER=0`.
+- `router_smoke.py` passes both shapes.
+- Outside the image, the same engine and AITER serve the 35B FP8 (TP1, router
+  on/off) and the 250B MXFP4 checkpoints (TP4 + EP, router on, with and
+  without shared-expert fusion) with correct output.
 
 Not verified:
 
 - `docker build` itself, the in-image `vllm serve`, and any benchmark or
   accuracy run on this image.
-- The FP8 throughput figures come from cfg7, which ran the same revisions
-  outside this image.
+- The 35B MXFP4 checkpoint on v0.31.0.
 - The wvSplitK fix is compiled in, but the fault it repairs was not
   reproduced.
+
+Known tuning gap: with shared-expert fusion under expert parallel, v0.31.0's
+250B MoE runs at 81 experts / topk 10 per rank, which the MXFP4 table (81 /
+topk 8) does not cover, so AITER uses its default heuristics there.
