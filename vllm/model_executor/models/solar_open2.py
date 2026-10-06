@@ -725,8 +725,11 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             q, k, v, b, f_a, g_a = fused.split(self.in_split, dim=-1)
             # Pass RAW b logits (pre-sigmoid) through the op's beta slot; _forward
             # derives the gated beta = sigmoid(b)*[2] where needed (prefill gates
-            # there; the fused decode kernel sigmoids inline).
-            beta = b.float().unsqueeze(0)
+            # there; the fused decode kernel sigmoids inline). Left as a strided
+            # column-slice view of the fused in_proj output: prefill's .float()
+            # rematerializes it anyway and decode reads it in place via
+            # stride_b_tok, so a copy here is one dead kernel launch per layer.
+            beta = b.unsqueeze(0)
         else:
             q = self.q_proj(hidden_states)[0]
             k = self.k_proj(hidden_states)[0]
@@ -748,7 +751,9 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         g_proj_states = self.g_b_proj(g_a)[0]
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
-        core_attn_out = torch.zeros(
+        # Rows the op leaves unwritten (cudagraph padding, profile/dummy runs)
+        # only ever reach row-local ops and are discarded.
+        core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -872,7 +877,7 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
                 a=rearrange(g1, "1 n h d -> n h d")[:n_dec],
-                b=rearrange(beta, "1 n h -> n h")[:n_dec],
+                b=beta[:, :n_dec],
                 dt_bias=self.dt_bias,
                 q=q[:, :n_dec],
                 k=k[:, :n_dec],

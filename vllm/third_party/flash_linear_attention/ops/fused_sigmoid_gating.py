@@ -54,6 +54,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_q_tok: tl.constexpr,  # q per-token stride (H*K packed; larger for a view)
     stride_k_tok: tl.constexpr,
     stride_v_tok: tl.constexpr,
+    stride_b_tok: tl.constexpr,  # b per-token stride (HV packed; larger for a view)
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
@@ -96,7 +97,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_a = a + (bos * HV + i_hv) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
 
-    p_b = b + bos * HV + i_hv
+    p_b = b + bos * stride_b_tok + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
@@ -180,7 +181,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_k += stride_k_tok
         p_o += HV * V
         p_v += stride_v_tok
-        p_b += HV
+        p_b += stride_b_tok
+        # FIXME: under IS_KDA `a` is [T, HV, K] (see p_a above), so the per-token
+        # stride is HV * K, not HV. Dormant while every caller runs T == 1, but
+        # wrong for multi-token sequences (spec decoding).
         p_a += HV
 
 
@@ -276,10 +280,24 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_q_tok = q.stride(1)
     stride_k_tok = k.stride(1)
     stride_v_tok = v.stride(1)
+    # Same for b [T, HV] / [B, T, HV]: a column slice of a fused projection
+    # output keeps head-stride 1 and only widens the token stride.
+    if not (
+        b.stride(-1) == 1
+        and (
+            b.ndim == 2
+            or (
+                b.ndim == 3
+                and (b.shape[0] == 1 or b.stride(0) == b.shape[1] * b.stride(1))
+            )
+        )
+    ):
+        b = b.contiguous()
+    stride_b_tok = b.stride(-2)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a.contiguous(),
-        b=b.contiguous(),
+        b=b,
         dt_bias=dt_bias,
         beta=beta,
         threshold=threshold,
@@ -309,6 +327,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_q_tok=stride_q_tok,
         stride_k_tok=stride_k_tok,
         stride_v_tok=stride_v_tok,
+        stride_b_tok=stride_b_tok,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
