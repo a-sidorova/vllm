@@ -32,12 +32,14 @@ import torch
 from einops import rearrange
 from torch import nn
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (
     divide,
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -83,6 +85,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
+from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from vllm.third_party.flash_linear_attention.ops.kda import (
     FusedRMSNormGated,
     chunk_kda_with_fused_gate,
@@ -120,6 +125,60 @@ def is_gqa_layer(config, layer_idx: int) -> bool:
     if gqa_layers is not None:
         return layer_idx in gqa_layers
     return (layer_idx + 1) % config.gqa_interval == 0
+
+
+def _fused_qkv_view(q, k, v):
+    """``[n, 3*w]`` concat of q/k/v, zero-copy when they are adjacent column-slices
+    of one buffer (the common case: the fused in_proj output). The custom-op /
+    torch.compile boundary does not guarantee that adjacency, so fall back to a
+    real ``torch.cat`` when it does not hold -- correctness never depends on it."""
+    w = q.shape[-1]
+    if (
+        q.stride(-1) == 1
+        and q.untyped_storage().data_ptr()
+        == k.untyped_storage().data_ptr()
+        == v.untyped_storage().data_ptr()
+        and k.storage_offset() == q.storage_offset() + w
+        and v.storage_offset() == q.storage_offset() + 2 * w
+    ):
+        return q.as_strided((q.shape[0], 3 * w), q.stride(), q.storage_offset())
+    return torch.cat([q, k, v], dim=-1)
+
+
+def _make_fused_qkv_conv1d_weight_loader(dims, tp_size, tp_rank):
+    """Load the separate q/k/v conv1d checkpoint tensors into ONE fused conv1d
+    param at load time (Olmo pattern). ``dims`` = per-section un-sharded output
+    sizes [q, k, v]; ``loaded_shard_id`` in {0,1,2} picks the section."""
+    sharded_dims = [d // tp_size for d in dims]
+
+    def weight_loader(param, loaded_weight, loaded_shard_id=None):
+        assert loaded_shard_id in (0, 1, 2)
+        if loaded_weight.dim() == 2:
+            loaded_weight = loaded_weight.unsqueeze(1)
+        shard_size = dims[loaded_shard_id] // tp_size
+        tp_start = tp_rank * shard_size
+        sharded = loaded_weight[tp_start : tp_start + shard_size]
+        offset = sum(sharded_dims[:loaded_shard_id])
+        param.data[offset : offset + shard_size].copy_(sharded)
+
+    return weight_loader
+
+
+def _load_in_proj_dup_shard(
+    param, loaded_weight, shard_id, output_sizes, head_dim, tp_size
+):
+    """Load a DUPLICATED shard (f_a/g_a) of the KDA fused in_proj.
+
+    These logically-replicated projections have their output rows duplicated
+    tp_size times in the merged param. The checkpoint holds ONE copy
+    ([head_dim, hidden]); every rank must load that FULL copy into its own
+    per-rank slice (no source narrowing). The destination offset is the sum of
+    the prior shards' per-rank sizes.
+    """
+    per_rank = [o // tp_size for o in output_sizes]
+    offset = sum(per_rank[:shard_id])
+    dst = param.data.narrow(0, offset, head_dim)
+    dst.copy_(loaded_weight)
 
 
 class SolarOpen2MLP(nn.Module):
@@ -271,6 +330,9 @@ class SolarOpen2Attention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # ROCm/AITER fused zero-copy attention path. Off by default so other
+        # vendors keep the stock contiguous-qkv behaviour.
+        self.fused_path = rocm_aiter_ops.is_enabled()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -346,11 +408,15 @@ class SolarOpen2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        if not self.fused_path:
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        # Fused path passes the strided q/k/v split views straight to attention:
+        # both consumers accept strided input (reshape_and_cache_flash reads
+        # per-token key/value strides; aiter's Triton unified_attention passes
+        # q.stride(0/1) into the kernel), so the per-GQA-layer copy is avoided.
         if self.use_qk_norm:
             q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
                 q.shape
@@ -365,7 +431,7 @@ class SolarOpen2Attention(nn.Module):
         if self.use_gqa_gate:
             gate, _ = self.g_proj(hidden_states)
             attn_output = attn_output * torch.sigmoid(gate)
-        output[:], _ = self.o_proj(attn_output)
+        return self.o_proj(attn_output)[0]
 
 
 def kda_attention(
@@ -459,6 +525,102 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = kda_config["short_conv_kernel_size"]
 
+        # ROCm/AITER fused input-projection + conv path. Off by default so other
+        # vendors keep separate projections/convs and the two-kernel decode.
+        self.fused_path = rocm_aiter_ops.is_enabled()
+        if self.fused_path:
+            self._init_fused_projections(projection_size, prefix)
+        else:
+            self._init_unfused_projections(projection_size, prefix)
+
+        self.f_b_proj = ColumnParallelLinear(
+            self.head_dim,
+            projection_size,
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.f_b_proj",
+        )
+        self.dt_bias = nn.Parameter(
+            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
+        )
+        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+
+        self.A_log = nn.Parameter(
+            torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
+        )
+        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
+
+        self.g_b_proj = ColumnParallelLinear(
+            self.head_dim,
+            projection_size,
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.g_b_proj",
+        )
+        self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        self.o_proj = RowParallelLinear(
+            projection_size,
+            self.hidden_size,
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
+    def _init_fused_projections(self, projection_size: int, prefix: str) -> None:
+        # Fold the six projections that read hidden_states (q/k/v/b/f_a/g_a) into
+        # one MergedColumnParallelLinear. q/k/v/b are column-parallel; f_a/g_a are
+        # logically REPLICATED (f_b/g_b read the full head_dim on every rank), so
+        # their output rows are duplicated tp times in the merge (output_size
+        # head_dim*tp -> sharded /tp -> each rank recovers the full head_dim). Same
+        # compute/memory as the replicated modules, but one GEMM launch.
+        tp = self.tp_size
+        self.in_proj_output_sizes = [
+            projection_size,
+            projection_size,
+            projection_size,
+            self.num_heads,
+            self.head_dim * tp,
+            self.head_dim * tp,
+        ]
+        self.in_proj = MergedColumnParallelLinear(
+            self.hidden_size,
+            self.in_proj_output_sizes,
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.in_proj",
+        )
+        # per-rank split sizes (output_sizes // tp) in the forward output.
+        self.in_split = [size // tp for size in self.in_proj_output_sizes]
+
+        # One conv1d over concat[q,k,v], materialized at load time from the
+        # separate checkpoint convs via a fused weight loader (Olmo pattern).
+        # conv_state is stored whole, so decode/prefill run a single conv.
+        self.conv1d = ColumnParallelLinear(
+            input_size=self.conv_size,
+            output_size=projection_size * 3,
+            bias=False,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}.conv1d",
+        )
+        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
+        delattr(self.conv1d.weight, "weight_loader")
+        set_weight_attrs(
+            self.conv1d.weight,
+            {
+                "weight_loader": _make_fused_qkv_conv1d_weight_loader(
+                    [projection_size, projection_size, projection_size],
+                    self.tp_size,
+                    get_tensor_model_parallel_rank(),
+                )
+            },
+        )
+
+    def _init_unfused_projections(self, projection_size: int, prefix: str) -> None:
         self.q_proj = ColumnParallelLinear(
             self.hidden_size,
             projection_size,
@@ -480,7 +642,13 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.v_proj",
         )
-
+        self.b_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.num_heads,
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.b_proj",
+        )
         self.f_a_proj = ReplicatedLinear(
             self.hidden_size,
             self.head_dim,
@@ -488,24 +656,12 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.f_a_proj",
         )
-        self.f_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.f_b_proj",
-        )
-        self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
-        )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
-
-        self.b_proj = ColumnParallelLinear(
+        self.g_a_proj = ReplicatedLinear(
             self.hidden_size,
-            self.num_heads,
+            self.head_dim,
             bias=False,
             quant_config=self.quant_config,
-            prefix=f"{prefix}.b_proj",
+            prefix=f"{prefix}.g_a_proj",
         )
 
         self.q_conv1d = ColumnParallelLinear(
@@ -537,62 +693,40 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         self.k_conv1d.weight.data = self.k_conv1d.weight.data.unsqueeze(1)
         self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
 
-        self.A_log = nn.Parameter(
-            torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
-        )
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
-
-        self.g_a_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.g_a_proj",
-        )
-        self.g_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.g_b_proj",
-        )
-        self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
-        self.o_proj = RowParallelLinear(
-            projection_size,
-            self.hidden_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
-
-        compilation_config = vllm_config.compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
-        q = self.q_proj(hidden_states)[0]
-        k = self.k_proj(hidden_states)[0]
-        v = self.v_proj(hidden_states)[0]
+        if self.fused_path:
+            # Single fused GEMM for all six input projections; split per-rank
+            # outputs. f_a/g_a slices are the full head_dim (duplicated tp times).
+            fused = self.in_proj(hidden_states)[0]
+            q, k, v, b, f_a, g_a = fused.split(self.in_split, dim=-1)
+            # Pass RAW b logits (pre-sigmoid) through the op's beta slot; _forward
+            # derives the gated beta = sigmoid(b)*[2] where needed (prefill gates
+            # there; the fused decode kernel sigmoids inline).
+            beta = b.float().unsqueeze(0)
+        else:
+            q = self.q_proj(hidden_states)[0]
+            k = self.k_proj(hidden_states)[0]
+            v = self.v_proj(hidden_states)[0]
+            beta = self.b_proj(hidden_states)[0].float().sigmoid()
+            if self.allow_neg_eigval:
+                beta = beta * 2.0
+            beta = beta.unsqueeze(0)
+            f_a = self.f_a_proj(hidden_states)[0]
+            g_a = self.g_a_proj(hidden_states)[0]
 
-        beta = self.b_proj(hidden_states)[0].float().sigmoid()
-        if self.allow_neg_eigval:
-            beta = beta * 2.0
         # Pass the RAW (ungated) g1 to torch.ops.vllm.kda_attention. The op
         # applies the KDA decay gate internally (chunk_kda_with_fused_gate in
-        # prefill, fused_kda_gate in decode). Pre-gating here double-applies the
-        # decay and degenerates generation.
-        g1 = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
-        beta = beta.unsqueeze(0)
+        # prefill, fused_kda_gate / the fused decode kernel in decode).
+        # Pre-gating here double-applies the decay and degenerates generation.
+        g1 = self.f_b_proj(f_a)[0]
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
 
-        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+        g_proj_states = self.g_b_proj(g_a)[0]
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
         core_attn_out = torch.zeros(
@@ -611,7 +745,7 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        output[:] = self.o_proj(core_attn_out)[0]
+        return self.o_proj(core_attn_out)[0]
 
     def _forward(
         self,
@@ -659,6 +793,166 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
 
+        if self.fused_path:
+            q, k, v = self._fused_qkv_conv(
+                q_proj_states,
+                k_proj_states,
+                v_proj_states,
+                conv_state,
+                attn_metadata_narrowed,
+            )
+        else:
+            q, k, v = self._unfused_qkv_conv(
+                q_proj_states,
+                k_proj_states,
+                v_proj_states,
+                conv_state,
+                attn_metadata_narrowed,
+            )
+
+        q, k, v = map(
+            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim), (q, k, v)
+        )
+
+        if attn_metadata_narrowed.num_prefills > 0:
+            if self.fused_path:
+                # The fused path carries RAW b logits; gate them here.
+                beta = beta.float().sigmoid()
+                if self.allow_neg_eigval:
+                    beta = beta * 2.0
+            assert non_spec_state_indices_tensor is not None
+            assert has_initial_state is not None
+            zero_idx = non_spec_state_indices_tensor[~has_initial_state]
+            recurrent_state[zero_idx] = 0
+            initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
+            (
+                core_attn_out_non_spec,
+                last_recurrent_state,
+            ) = chunk_kda_with_fused_gate(
+                q=q,
+                k=k,
+                v=v,
+                raw_g=g1,
+                beta=beta,
+                A_log=self.A_log,
+                g_bias=self.dt_bias,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=non_spec_query_start_loc,
+            )
+            # Init cache
+            recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+        elif self.fused_path:
+            # Decode: single fused gate+recurrent kernel. Pass RAW g1 (a) and RAW
+            # b logits; the kernel applies softplus/-exp(A_log) gating and
+            # sigmoid(b)[*2] internally. Decode tokens live at the front of the
+            # non-spec batch and are written straight into core_attn_out.
+            assert non_spec_query_start_loc is not None
+            n_dec = attn_metadata_narrowed.num_decodes
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                a=rearrange(g1, "1 n h d -> n h d")[:n_dec],
+                b=rearrange(beta, "1 n h -> n h")[:n_dec],
+                dt_bias=self.dt_bias,
+                q=q[:, :n_dec],
+                k=k[:, :n_dec],
+                v=v[:, :n_dec],
+                initial_state=recurrent_state,
+                inplace_final_state=True,
+                cu_seqlens=non_spec_query_start_loc[: n_dec + 1],
+                ssm_state_indices=non_spec_state_indices_tensor,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=True,
+                neg_eigval=self.allow_neg_eigval,
+                out=core_attn_out[:, :n_dec],
+            )
+            return
+        else:
+            assert non_spec_query_start_loc is not None
+            g1 = fused_kda_gate(
+                rearrange(g1, "1 n h d -> n (h d)"),
+                self.A_log,
+                self.head_dim,
+                g_bias=self.dt_bias,
+            ).unsqueeze(0)
+            (
+                core_attn_out_non_spec,
+                last_recurrent_state,
+            ) = fused_recurrent_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g1,
+                beta=beta,
+                initial_state=recurrent_state,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=non_spec_query_start_loc[
+                    : attn_metadata_narrowed.num_decodes + 1
+                ],
+                ssm_state_indices=non_spec_state_indices_tensor,
+            )
+        core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
+            0, :num_actual_tokens
+        ]
+
+    def _fused_qkv_conv(
+        self,
+        q_proj_states: torch.Tensor,
+        k_proj_states: torch.Tensor,
+        v_proj_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # ONE causal conv over concat[q,k,v] via the merged conv1d weight, then
+        # split. The conv input is a zero-copy strided view over the adjacent
+        # q/k/v slices of the fused in_proj output (_fused_qkv_view); the split
+        # yields strided views that the fused decode kernel reads in place.
+        qkv_conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        split_size = q_proj_states.shape[-1]
+        state_indices = attn_metadata.non_spec_state_indices_tensor
+        if attn_metadata.num_prefills > 0:
+            qkv = _fused_qkv_view(q_proj_states, k_proj_states, v_proj_states)
+            qkv = causal_conv1d_fn(
+                qkv.transpose(0, 1),
+                qkv_conv_weights,
+                self.conv1d.bias,
+                activation="silu",
+                conv_states=conv_state,
+                has_initial_state=attn_metadata.has_initial_state,
+                cache_indices=state_indices,
+                query_start_loc=attn_metadata.non_spec_query_start_loc,
+                metadata=attn_metadata,
+            ).transpose(0, 1)
+        else:
+            assert state_indices is not None
+            qkv = causal_conv1d_update(
+                _fused_qkv_view(q_proj_states, k_proj_states, v_proj_states),
+                conv_state,
+                qkv_conv_weights,
+                self.conv1d.bias,
+                activation="silu",
+                conv_state_indices=state_indices[: attn_metadata.num_actual_tokens],
+                validate_data=True,
+            )
+        q, k, v = qkv.split(split_size, dim=-1)
+        return q, k, v
+
+    def _unfused_qkv_conv(
+        self,
+        q_proj_states: torch.Tensor,
+        k_proj_states: torch.Tensor,
+        v_proj_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        attn_metadata_narrowed: GDNAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        has_initial_state = attn_metadata_narrowed.has_initial_state
+        non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
+        non_spec_state_indices_tensor = (
+            attn_metadata_narrowed.non_spec_state_indices_tensor
+        )
         conv_state_q, conv_state_k, conv_state_v = conv_state.chunk(3, dim=-2)
 
         q_conv_weights = self.q_conv1d.weight.view(
@@ -739,62 +1033,7 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
                 conv_state_indices=decode_conv_indices,
                 validate_data=True,
             )
-
-        q, k, v = map(
-            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim), (q, k, v)
-        )
-
-        if attn_metadata_narrowed.num_prefills > 0:
-            assert non_spec_state_indices_tensor is not None
-            assert has_initial_state is not None
-            zero_idx = non_spec_state_indices_tensor[~has_initial_state]
-            recurrent_state[zero_idx] = 0
-            initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_kda_with_fused_gate(
-                q=q,
-                k=k,
-                v=v,
-                raw_g=g1,
-                beta=beta,
-                A_log=self.A_log,
-                g_bias=self.dt_bias,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
-            )
-            # Init cache
-            recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
-        else:
-            assert non_spec_query_start_loc is not None
-            g1 = fused_kda_gate(
-                rearrange(g1, "1 n h d -> n (h d)"),
-                self.A_log,
-                self.head_dim,
-                g_bias=self.dt_bias,
-            ).unsqueeze(0)
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = fused_recurrent_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g1,
-                beta=beta,
-                initial_state=recurrent_state,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc[
-                    : attn_metadata_narrowed.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-            )
-        core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-            0, :num_actual_tokens
-        ]
+        return q, k, v
 
 
 class SolarOpen2DecoderLayer(nn.Module):
@@ -873,13 +1112,10 @@ class SolarOpen2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        attn_output = torch.empty_like(hidden_states)
-        self.self_attn(
+        hidden_states = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
-            output=attn_output,
         )
-        hidden_states = attn_output
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -982,6 +1218,30 @@ class SolarOpen2Model(nn.Module):
         ]
         qkv_shard_names = ("q_proj", "k_proj", "v_proj")
 
+        # ROCm/AITER fused KDA in_proj/conv1d routing. When off, KDA layers keep
+        # separate projections/convs, which fall through to the default loaders
+        # below (q/k/v via the qkv_shard_names skip, the rest as plain params).
+        fused_path = rocm_aiter_ops.is_enabled()
+        if fused_path:
+            # q/k/v/b are standard merged shards (source narrowed by tp_rank);
+            # f_a/g_a are DUPLICATED shards (full source broadcast to every rank's
+            # slice). Shard order matches the KDA in_proj output_sizes.
+            kda_std_shard = {"q_proj": 0, "k_proj": 1, "v_proj": 2, "b_proj": 3}
+            kda_dup_shard = {"f_a_proj": 4, "g_a_proj": 5}
+            kda_conv_shard = {"q_conv1d": 0, "k_conv1d": 1, "v_conv1d": 2}
+            kda_head_dim = self.config.linear_attn_config["head_dim"]
+            kda_num_heads = self.config.linear_attn_config["num_heads"]
+            tp_size = get_tensor_model_parallel_world_size()
+            kda_proj_size = kda_head_dim * kda_num_heads
+            kda_in_proj_output_sizes = [
+                kda_proj_size,
+                kda_proj_size,
+                kda_proj_size,
+                kda_num_heads,
+                kda_head_dim * tp_size,
+                kda_head_dim * tp_size,
+            ]
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
@@ -989,6 +1249,49 @@ class SolarOpen2Model(nn.Module):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue
+            parts = name.split(".")
+            if fused_path and "layers" in parts:
+                j = parts.index("layers")
+                layer_idx = (
+                    int(parts[j + 1])
+                    if j + 1 < len(parts) and parts[j + 1].isdigit()
+                    else None
+                )
+                if layer_idx is not None and not is_gqa_layer(self.config, layer_idx):
+                    # conv1d routing first (q_conv1d must not be caught by q_proj).
+                    src = next((s for s in kda_conv_shard if f".{s}." in name), None)
+                    if src is not None:
+                        pname = name.replace(src, "conv1d")
+                        param = params_dict[pname]
+                        param.weight_loader(param, loaded_weight, kda_conv_shard[src])
+                        loaded_params.add(pname)
+                        continue
+                    src = next(
+                        (
+                            s
+                            for s in (*kda_std_shard, *kda_dup_shard)
+                            if f".{s}." in name
+                        ),
+                        None,
+                    )
+                    if src is not None:
+                        pname = name.replace(src, "in_proj")
+                        param = params_dict[pname]
+                        if src in kda_std_shard:
+                            param.weight_loader(
+                                param, loaded_weight, kda_std_shard[src]
+                            )
+                        else:
+                            _load_in_proj_dup_shard(
+                                param,
+                                loaded_weight,
+                                kda_dup_shard[src],
+                                kda_in_proj_output_sizes,
+                                kda_head_dim,
+                                tp_size,
+                            )
+                        loaded_params.add(pname)
+                        continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -1095,6 +1398,18 @@ class SolarOpen2ForCausalLM(
         "gate_up_proj": [
             "gate_proj",
             "up_proj",
+        ],
+        # KDA full fused input projection: in_proj = concat[q,k,v,b,f_a,g_a].
+        # Registering it lets the quark resolver decompose the fused name into its
+        # shards (all in the checkpoint's quant exclude list), so in_proj is built
+        # bf16 like its shards instead of falling through to the global fp4 config.
+        "in_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
         ],
     }
 
