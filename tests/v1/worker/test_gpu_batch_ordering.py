@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -309,3 +310,120 @@ def test_no_speculator_dispatches_on_query_length_alone():
         "these speculators classify a decode batch by query length alone; use "
         f"get_uniform_decode_token_count instead: {offenders}"
     )
+
+
+class _Dispatched(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    "query_lens,has_prefill",
+    [
+        # Every target request decoding with K + 1 tokens.
+        ([8, 8, 8, 8], False),
+        # Two of them are K + 1-token prompt chunks: the target falls back to
+        # PIECEWISE, but the draft batch is still uniform.
+        ([8, 8, 8, 8], True),
+        # Mixed decodes and prompt chunks of different lengths.
+        ([8, 8, 3, 100], True),
+    ],
+)
+def test_dflash_draft_dispatch_is_uniform_by_construction(
+    monkeypatch, query_lens: list[int], has_prefill: bool
+):
+    """DFlash dispatches its draft as a uniform num_query_per_req batch.
+
+    The draft query is rebuilt by prepare_dflash_inputs as exactly
+    num_query_per_req tokens per request, whatever the target batch held, so
+    the draft may use its FULL graph even when the target batch has prefills.
+    This pins the constant passed to dispatch; replacing it with a
+    classification of the target batch would needlessly drop the draft graph.
+    """
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_module
+
+    num_speculative_steps = 7
+    num_query_per_req = num_speculative_steps + 1
+    max_num_reqs, max_num_tokens, hidden_size = 8, 256, 4
+    num_reqs = len(query_lens)
+    num_target_tokens = sum(query_lens)
+
+    dispatched: dict[str, Any] = {}
+
+    def fake_dispatch(manager, num_reqs, num_tokens, uniform_token_count=None, **_):
+        dispatched.update(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            uniform_token_count=uniform_token_count,
+        )
+        raise _Dispatched
+
+    monkeypatch.setattr(dflash_module, "prepare_dflash_inputs", lambda *a, **k: None)
+    monkeypatch.setattr(dflash_module, "dispatch_cg_and_sync_dp", fake_dispatch)
+
+    speculator: Any = dflash_module.DFlashSpeculator.__new__(
+        dflash_module.DFlashSpeculator
+    )
+    speculator.num_speculative_steps = num_speculative_steps
+    speculator.num_query_per_req = num_query_per_req
+    speculator.max_num_reqs = max_num_reqs
+    speculator.max_num_tokens = max_num_tokens
+    speculator.max_model_len = 4096
+    speculator.hidden_states = torch.zeros(max_num_tokens, hidden_size)
+    speculator.prepare_context_anchor = lambda *a, **k: None
+    speculator.pcp_manager = None
+    speculator.input_buffers = None
+    speculator.context_positions = torch.zeros(max_num_tokens, dtype=torch.int64)
+    speculator._context_slot_mappings = torch.zeros(
+        1, max_num_tokens, dtype=torch.int64
+    )
+    speculator.sample_indices = None
+    speculator.sample_pos = None
+    speculator.sample_idx_mapping = None
+    speculator.temperature = None
+    speculator.seeds = None
+    speculator.parallel_drafting_token_id = 0
+    speculator.sample_from_anchor = False
+    speculator.dcp_size = 1
+    speculator.draft_kv_cache_group_id = 0
+    speculator.draft_kv_cache_group_ids = [0]
+    speculator.block_tables = SimpleNamespace(
+        slot_mappings=[None],
+        input_block_tables=[None],
+        kernel_block_sizes=[16],
+        cp_rank=0,
+        cp_interleave=1,
+    )
+    speculator.query_cudagraph_manager = None
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+
+    num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_tokens=num_target_tokens,
+        num_scheduled_tokens=num_scheduled_tokens,
+        has_prefill=has_prefill,
+        idx_mapping=torch.arange(num_reqs, dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.from_numpy(num_scheduled_tokens + 64),
+    )
+
+    with pytest.raises(_Dispatched):
+        speculator.propose(
+            input_batch,
+            attn_metadata={},
+            slot_mappings={},
+            last_hidden_states=torch.zeros(num_target_tokens, hidden_size),
+            aux_hidden_states=None,
+            num_sampled=torch.ones(num_reqs, dtype=torch.int32),
+            num_rejected=torch.zeros(num_reqs, dtype=torch.int32),
+            last_sampled=torch.zeros(max_num_reqs, dtype=torch.int64),
+            next_prefill_tokens=torch.zeros(max_num_reqs, dtype=torch.int32),
+            temperature=torch.zeros(max_num_reqs),
+            seeds=torch.zeros(max_num_reqs, dtype=torch.int64),
+        )
+
+    assert dispatched == {
+        "num_reqs": num_reqs,
+        "num_tokens": num_reqs * num_query_per_req,
+        "uniform_token_count": num_query_per_req,
+    }

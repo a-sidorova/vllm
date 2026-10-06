@@ -84,6 +84,34 @@ def test_aiter_unified_attention_capture_preserves_query_start_locations():
     assert torch.equal(actual.query_start_loc, expected_query_start_loc)
 
 
+def test_rocm_attention_capture_preserves_cpu_query_start_locations():
+    """Only the device query_start_loc may be zeroed during capture (#25985).
+    The CPU copy is shared with builders of later KV-cache groups, which derive
+    host-side batch composition from it."""
+    from vllm.v1.attention.backends.rocm_attn import RocmAttentionMetadataBuilder
+
+    builder = object.__new__(RocmAttentionMetadataBuilder)
+    metadata = MagicMock()
+    metadata.seq_lens = torch.tensor([1048576, 524288], dtype=torch.int32)
+    builder.build = MagicMock(return_value=metadata)
+    common = MagicMock()
+    expected_query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
+    common.query_start_loc = expected_query_start_loc.clone()
+    common.query_start_loc_cpu = expected_query_start_loc.clone()
+    query_start_loc_cpu = common.query_start_loc_cpu
+
+    actual = builder.build_for_cudagraph_capture(common)
+
+    builder.build.assert_called_once_with(0, common)
+    assert actual is metadata
+    assert torch.equal(actual.seq_lens, torch.ones_like(actual.seq_lens))
+    assert common.query_start_loc_cpu is query_start_loc_cpu
+    assert torch.equal(common.query_start_loc_cpu, expected_query_start_loc)
+    assert torch.equal(
+        common.query_start_loc, torch.zeros_like(expected_query_start_loc)
+    )
+
+
 @pytest.mark.parametrize("use_dcp", [False, True])
 @pytest.mark.parametrize(
     "env_vars, selected_backend, expected_backend_path",
