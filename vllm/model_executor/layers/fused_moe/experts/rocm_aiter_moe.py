@@ -733,6 +733,9 @@ class AiterFusedRouterExperts(mk.FusedMoEExpertsMonolithic):
     always falls back.
     """
 
+    # Both the fused kernel and the unfused fallback take AITER's 0/1 expert_mask.
+    consumes_expert_mask = True
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
