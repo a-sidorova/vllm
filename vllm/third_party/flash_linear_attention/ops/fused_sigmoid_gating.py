@@ -182,10 +182,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_o += HV * V
         p_v += stride_v_tok
         p_b += stride_b_tok
-        # FIXME: under IS_KDA `a` is [T, HV, K] (see p_a above), so the per-token
-        # stride is HV * K, not HV. Dormant while every caller runs T == 1, but
-        # wrong for multi-token sequences (spec decoding).
-        p_a += HV
+        if not IS_KDA:
+            p_a += HV
+        else:
+            p_a += HV * K
 
 
 def fused_sigmoid_gating_delta_rule_update(
@@ -215,6 +215,26 @@ def fused_sigmoid_gating_delta_rule_update(
     computation and the recurrent delta rule update for better performance.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
+
+    # The kernel locates a state slot as
+    #   ssm_state_indices + i_n * stride_indices_seq + i_t
+    # adding i_t raw (stride_indices_tok is never dereferenced), so 2-D rows
+    # must be contiguous, and a 1-D index (one slot per sequence) cannot
+    # address a speculative draft ladder. T is the packed token count across
+    # the varlen batch, not a per-sequence length -- do not gate on it.
+    if ssm_state_indices is not None:
+        if ssm_state_indices.ndim == 2:
+            assert ssm_state_indices.stride(-1) == 1, (
+                "ssm_state_indices rows must be contiguous: the kernel assumes "
+                f"stride(-1) == 1, got {ssm_state_indices.stride()}"
+            )
+        else:
+            assert num_accepted_tokens is None, (
+                "1-D ssm_state_indices has one slot per sequence and cannot "
+                "address a speculative draft ladder; pass a 2-D index tensor "
+                "when num_accepted_tokens is set"
+            )
+
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)

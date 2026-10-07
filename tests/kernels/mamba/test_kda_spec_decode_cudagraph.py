@@ -12,6 +12,12 @@ conv/recurrent state to be bit-identical to an eager run of the same steps.
 
 The eager reference uses a builder in PIECEWISE mode, i.e. the KDA op runs
 outside the graph on fresh metadata.
+
+Each test runs twice: on the generic (unfused) branch of
+``SolarOpen2KimiDeltaAttention._forward``, and (``fused_path``) on its fused
+branch, which runs one conv over concat[q, k, v] and
+``fused_sigmoid_gating_delta_rule_update`` on raw g1 and b, fed the way the
+fused model feeds it: q/k/v/b as column slices of one in_proj output.
 """
 
 from types import MethodType, SimpleNamespace
@@ -49,6 +55,16 @@ NUM_BLOCKS = 64
 # Requests that take turns in the batch, each owning 1 + K mamba blocks.
 NUM_POOL_REQS = 6
 BATCH = 4
+# Per-rank columns of the fused in_proj output: q, k, v, b, then f_a and g_a.
+IN_PROJ_SPLIT = [PROJ, PROJ, PROJ, NUM_HEADS, 2 * HEAD_DIM]
+RECURRENT_KERNELS = ("fused_recurrent_kda", "fused_sigmoid_gating_delta_rule_update")
+# What each path launches while the all-spec batch is captured.
+SPEC_LAUNCHES = {
+    False: SimpleNamespace(num_convs=3, recurrent="fused_recurrent_kda"),
+    True: SimpleNamespace(
+        num_convs=1, recurrent="fused_sigmoid_gating_delta_rule_update"
+    ),
+}
 
 
 def _make_builder(num_spec: int, full_cuda_graph: bool) -> GDNAttentionMetadataBuilder:
@@ -142,6 +158,69 @@ def _make_layer(kv_cache: list[torch.Tensor], weights: dict, num_spec: int):
     return layer
 
 
+def _make_fused_layer(kv_cache: list[torch.Tensor], weights: dict, num_spec: int):
+    from vllm.model_executor.models.solar_open2 import SolarOpen2KimiDeltaAttention
+
+    conv_weight = torch.cat(
+        [weights[name] for name in ("q_conv1d", "k_conv1d", "v_conv1d")]
+    )
+    layer = SimpleNamespace(
+        fused_path=True,
+        prefix=LAYER,
+        kv_cache=tuple(kv_cache),
+        head_dim=HEAD_DIM,
+        local_num_heads=NUM_HEADS,
+        num_spec=num_spec,
+        A_log=weights["A_log"],
+        dt_bias=weights["dt_bias"],
+        conv1d=SimpleNamespace(weight=conv_weight, bias=None),
+        allow_neg_eigval=True,
+    )
+    for name in ("_spec_qkv_conv", "_fused_qkv_conv"):
+        setattr(
+            layer, name, MethodType(getattr(SolarOpen2KimiDeltaAttention, name), layer)
+        )
+    return layer
+
+
+def _random_fused_inputs(num_tokens: int) -> dict[str, torch.Tensor]:
+    return {
+        "in_proj": torch.randn(
+            num_tokens, sum(IN_PROJ_SPLIT), device="cuda", dtype=torch.bfloat16
+        ),
+        "g1": torch.randn(
+            1, num_tokens, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+        ),
+    }
+
+
+def _fused_op_inputs(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """What SolarOpen2KimiDeltaAttention.forward hands the op: q/k/v as adjacent
+    column slices of the in_proj output (so the conv input is a zero-copy view)
+    and beta as the raw b logits, a strided column slice of the same buffer."""
+    q, k, v, b, _ = inputs["in_proj"].split(IN_PROJ_SPLIT, dim=-1)
+    return {
+        "q_proj_states": q,
+        "k_proj_states": k,
+        "v_proj_states": v,
+        "g1": inputs["g1"],
+        "beta": b.unsqueeze(0),
+    }
+
+
+def _base_op_inputs(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The same step as the base layer takes it: separate q/k/v and the gated
+    beta, 2 * sigmoid(b) under kda_allow_neg_eigval."""
+    q, k, v, b, _ = inputs["in_proj"].split(IN_PROJ_SPLIT, dim=-1)
+    return {
+        "q_proj_states": q.contiguous(),
+        "k_proj_states": k.contiguous(),
+        "v_proj_states": v.contiguous(),
+        "g1": inputs["g1"].clone(),
+        "beta": (2.0 * b.float().sigmoid()).unsqueeze(0),
+    }
+
+
 def _random_inputs(num_tokens: int) -> dict[str, torch.Tensor]:
     def proj():
         return torch.randn(num_tokens, PROJ, device="cuda", dtype=torch.bfloat16)
@@ -173,9 +252,22 @@ class _Harness:
     The graph side owns a FULL-mode builder, V2-runner-style persistent input
     buffers and a CUDA graph captured from a dummy all-spec batch. The eager
     side owns a PIECEWISE-mode builder and its own copy of the KV cache.
+
+    With ``fused_path`` a third, base-layer side runs each step eagerly on the
+    eager side's metadata and its own cache copy, as an independent reference:
+    replay-vs-eager cannot see a bug the graph and eager sides share.
+
+    ``launches`` records the conv and recurrent-kernel calls made while the
+    graph was being captured.
     """
 
-    def __init__(self, monkeypatch, num_spec: int, zero_query_start_loc: bool):
+    def __init__(
+        self,
+        monkeypatch,
+        num_spec: int,
+        zero_query_start_loc: bool,
+        fused_path: bool = False,
+    ):
         from vllm.model_executor.models import solar_open2 as mod
 
         self.num_spec = num_spec
@@ -200,12 +292,36 @@ class _Harness:
         }
         weights["A_log"] = 0.5 * torch.randn(1, 1, NUM_HEADS, 1, device="cuda") - 1
         weights["dt_bias"] = 0.1 * torch.randn(PROJ, device="cuda")
-        self.graph_layer = _make_layer(graph_kv, weights, num_spec)
-        self.eager_layer = _make_layer(eager_kv, weights, num_spec)
+        if fused_path:
+            make_layer = _make_fused_layer
+            self._make_inputs = _random_fused_inputs
+            self._op_inputs = _fused_op_inputs
+            self.base_raw = self.graph_raw.clone()
+            self.base_kv = _state_views(spec, self.base_raw)
+            self.base_layer = _make_layer(self.base_kv, weights, num_spec)
+        else:
+            make_layer = _make_layer
+            self._make_inputs = _random_inputs
+            self._op_inputs = dict
+            self.base_layer = None
+        # Both paths are branches of the same _forward, picked by the layer's
+        # fused_path; the base side runs the generic branch.
+        self._kda_forward = mod.SolarOpen2KimiDeltaAttention._forward
+        self._base_forward = mod.SolarOpen2KimiDeltaAttention._forward
+        self.graph_layer = make_layer(graph_kv, weights, num_spec)
+        self.eager_layer = make_layer(eager_kv, weights, num_spec)
 
         self.forward_context = SimpleNamespace(attn_metadata=None)
         monkeypatch.setattr(mod, "get_forward_context", lambda: self.forward_context)
-        self._kda_forward = mod.SolarOpen2KimiDeltaAttention._forward
+
+        self._recording = False
+        self.launches: dict[str, list[SimpleNamespace]] = {}
+        for name in (
+            "causal_conv1d_update",
+            "fused_recurrent_kda",
+            "fused_sigmoid_gating_delta_rule_update",
+        ):
+            self._record(monkeypatch, mod, name)
 
         # Distinct, shuffled, non-null block ids: every (request, ladder slot)
         # pair addresses its own state.
@@ -228,13 +344,26 @@ class _Harness:
         self.num_accepted_buf = torch.ones(
             MAX_NUM_SEQS, dtype=torch.int32, device="cuda"
         )
-        self.graph_inputs = _random_inputs(max_tokens)
+        self.graph_inputs = self._make_inputs(max_tokens)
         self.graph_output = _empty_output(max_tokens)
         self.graph, self.captured = self._capture(zero_query_start_loc)
 
+    def _record(self, monkeypatch, module, name: str):
+        fn = getattr(module, name)
+        calls = self.launches[name] = []
+
+        def recorded(*args, **kwargs):
+            if self._recording:
+                calls.append(SimpleNamespace(args=args, kwargs=kwargs))
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, recorded)
+
     def _run(self, layer, meta: GDNAttentionMetadata, inputs, core_attn_out):
         self.forward_context.attn_metadata = {LAYER: meta}
-        self._kda_forward(layer, **inputs, core_attn_out=core_attn_out)
+        self._kda_forward(
+            layer, **self._op_inputs(inputs), core_attn_out=core_attn_out
+        )
 
     def _common(
         self,
@@ -311,10 +440,12 @@ class _Harness:
                 self._run(self.graph_layer, meta, self.graph_inputs, self.graph_output)
                 torch.cuda.synchronize()
             else:
+                self._recording = True
                 with torch.cuda.graph(graph):
                     self._run(
                         self.graph_layer, meta, self.graph_inputs, self.graph_output
                     )
+                self._recording = False
         torch.cuda.synchronize()
         return graph, meta
 
@@ -334,7 +465,7 @@ class _Harness:
         block_rows = self.req_blocks[reqs]
         num_reqs, num_tokens = len(rows), sum(query_lens)
         draft_counts = [d if d > 0 else -1 for _, d in rows]
-        inputs = _random_inputs(num_tokens)
+        inputs = self._make_inputs(num_tokens)
 
         if replay:
             assert all(d == self.num_spec for _, d in rows)
@@ -367,6 +498,7 @@ class _Harness:
                 (dst[:num_tokens] if x.dim() == 2 else dst[:, :num_tokens]).copy_(x)
             self.graph_output.fill_(float("nan"))
             self.graph.replay()
+            # Rows past num_tokens are request padding; nothing constrains them.
             graph_out = self.graph_output[0, :num_tokens].clone()
         else:
             out = _empty_output(num_tokens)
@@ -395,6 +527,14 @@ class _Harness:
             {k: v.clone() for k, v in inputs.items()},
             eager_out,
         )
+        if self.base_layer is not None:
+            self.base_out = _empty_output(num_tokens)
+            self.forward_context.attn_metadata = {LAYER: eager_meta}
+            self._base_forward(
+                self.base_layer,
+                **_base_op_inputs(inputs),
+                core_attn_out=self.base_out,
+            )
         torch.cuda.synchronize()
 
         for r, (_, d), a in zip(reqs, rows, accepted):
@@ -434,21 +574,70 @@ def _assert_step_matches(h: _Harness, graph_out, eager_out, reqs, rec_before):
     )
     torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
     h.assert_same_state()
+    if h.base_layer is not None:
+        # Conv is per-channel, so one conv over 3P channels is bit-exact with
+        # three over P; the recurrent kernels differ, so output (bf16) and
+        # recurrent state (fp32) match at the default dtype tolerances.
+        torch.testing.assert_close(
+            h.graph_kv[0], h.base_kv[0], rtol=0, atol=0, msg="conv state vs base"
+        )
+        torch.testing.assert_close(
+            h.graph_kv[1], h.base_kv[1], msg="recurrent state vs base"
+        )
+        torch.testing.assert_close(graph_out, h.base_out[0])
     blocks = h.ladder_blocks(reqs)
     assert not torch.equal(h.graph_kv[1][blocks], rec_before[blocks]), (
         "the step did not advance the recurrent state of the batch"
     )
 
 
+by_path = pytest.mark.parametrize("fused_path", [False, True], ids=["base", "fused"])
+
+
+def _assert_captured_spec_branch(h: _Harness, fused_path: bool):
+    """The graph holds the path's speculative branch: its recurrent kernel on
+    the 2-D ladder and the accepted counts, and not the other path's."""
+    captured = h.captured
+    expected = SPEC_LAUNCHES[fused_path]
+    convs = h.launches["causal_conv1d_update"]
+    assert len(convs) == expected.num_convs
+    for name in RECURRENT_KERNELS:
+        if name != expected.recurrent:
+            assert not h.launches[name], f"{name} was captured"
+    assert len(h.launches[expected.recurrent]) == 1, expected.recurrent
+    rec = h.launches[expected.recurrent][0].kwargs
+    assert rec["ssm_state_indices"] is captured.spec_state_indices_tensor
+    assert rec["num_accepted_tokens"] is captured.num_accepted_tokens
+    for conv in convs:
+        assert conv.kwargs["num_accepted_tokens"] is captured.num_accepted_tokens
+    if fused_path:
+        in_proj = h.graph_inputs["in_proj"]
+        x = convs[0].args[0]
+        assert x.data_ptr() == in_proj.data_ptr()
+        assert x.stride() == (in_proj.stride(0), 1), (
+            "the captured conv must read the in_proj output in place"
+        )
+        assert rec["b"].data_ptr() == in_proj[:, 3 * PROJ].data_ptr(), "raw b in place"
+        assert rec["out"].data_ptr() == h.graph_output.data_ptr(), (
+            "the captured kernel must write the persistent core_attn_out"
+        )
+
+
+@by_path
 @pytest.mark.parametrize("num_spec", [3, 7])
-def test_full_graph_replay_of_spec_branch_matches_eager(monkeypatch, num_spec):
+def test_full_graph_replay_of_spec_branch_matches_eager(
+    monkeypatch, num_spec, fused_path
+):
     torch.manual_seed(0)
-    h = _Harness(monkeypatch, num_spec, zero_query_start_loc=False)
+    h = _Harness(
+        monkeypatch, num_spec, zero_query_start_loc=False, fused_path=fused_path
+    )
 
     captured = h.captured
     assert captured.num_spec_decodes == BATCH
     assert captured.num_decodes == 0 and captured.num_prefills == 0
     assert captured.spec_sequence_masks is not None
+    _assert_captured_spec_branch(h, fused_path)
     h.assert_same_state()
 
     for reqs, accepted in _spec_schedule(num_spec):
@@ -470,12 +659,15 @@ def test_full_graph_replay_of_spec_branch_matches_eager(monkeypatch, num_spec):
         _assert_step_matches(h, graph_out, eager_out, reqs, rec_before)
 
 
-def test_capture_with_zeroed_query_start_loc_diverges(monkeypatch):
+@by_path
+def test_capture_with_zeroed_query_start_loc_diverges(monkeypatch, fused_path):
     """Negative control: a capture whose query start locations were zeroed by
     another builder must be caught by the replay-vs-eager comparison above."""
     num_spec = 7
     torch.manual_seed(0)
-    h = _Harness(monkeypatch, num_spec, zero_query_start_loc=True)
+    h = _Harness(
+        monkeypatch, num_spec, zero_query_start_loc=True, fused_path=fused_path
+    )
 
     assert h.captured.num_spec_decodes == 0
     assert h.captured.num_decodes == BATCH
@@ -496,8 +688,11 @@ def test_capture_with_zeroed_query_start_loc_diverges(monkeypatch):
     assert not torch.equal(graph_out, eager_out)
 
 
+@by_path
 @pytest.mark.parametrize("transition", ["decode", "mixed"])
-def test_fold_after_replayed_spec_steps_matches_eager(monkeypatch, transition):
+def test_fold_after_replayed_spec_steps_matches_eager(
+    monkeypatch, transition, fused_path
+):
     """Replayed spec steps leave state on the draft ladder and the conv window
     rolled; the next non-speculative read folds it back using
     non_spec_committed_state_indices / non_spec_num_accepted_tokens. That fold
@@ -511,7 +706,9 @@ def test_fold_after_replayed_spec_steps_matches_eager(monkeypatch, transition):
     num_spec = 7
     full, mid = num_spec + 1, num_spec // 2 + 1
     torch.manual_seed(0)
-    h = _Harness(monkeypatch, num_spec, zero_query_start_loc=False)
+    h = _Harness(
+        monkeypatch, num_spec, zero_query_start_loc=False, fused_path=fused_path
+    )
     reqs = [0, 1, 2, 3]
 
     for accepted in ([full, 1, mid, 2], [2, full, mid, 1]):

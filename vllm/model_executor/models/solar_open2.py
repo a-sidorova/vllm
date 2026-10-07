@@ -134,10 +134,11 @@ def is_gqa_layer(config, layer_idx: int) -> bool:
 
 
 def _use_amd_fused_kda(vllm_config: VllmConfig) -> bool:
-    # The fused projection/conv path does not implement speculative KDA state
-    # forking and accepted-state recovery. Keep the generic KDA path for
-    # speculative serving; target-only ROCm serving retains the fused path.
-    return rocm_aiter_ops.is_enabled() and vllm_config.speculative_config is None
+    # Selects both the fused KDA modules/forward (SolarOpen2KimiDeltaAttention)
+    # and the matching checkpoint routing (SolarOpen2Model.load_weights), so
+    # every caller must get the same answer for one config. The fused forward
+    # covers speculative decoding as well, so only the platform gates it.
+    return rocm_aiter_ops.is_enabled()
 
 
 def _fused_qkv_view(q, k, v):
@@ -627,7 +628,8 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
 
         # One conv1d over concat[q,k,v], materialized at load time from the
         # separate checkpoint convs via a fused weight loader (Olmo pattern).
-        # conv_state is stored whole, so decode/prefill run a single conv.
+        # conv_state is stored whole, so every branch (prefill, decode,
+        # speculative decode) runs a single conv.
         self.conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
             output_size=projection_size * 3,
@@ -734,10 +736,11 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             q, k, v, b, f_a, g_a = fused.split(self.in_split, dim=-1)
             # Pass RAW b logits (pre-sigmoid) through the op's beta slot; _forward
             # derives the gated beta = sigmoid(b)*[2] where needed (prefill gates
-            # there; the fused decode kernel sigmoids inline). Left as a strided
-            # column-slice view of the fused in_proj output: prefill's .float()
-            # rematerializes it anyway and decode reads it in place via
-            # stride_b_tok, so a copy here is one dead kernel launch per layer.
+            # there; the fused decode/speculative kernel sigmoids inline). Left
+            # as a strided column-slice view of the fused in_proj output:
+            # prefill's .float() rematerializes it anyway and decode/speculative
+            # decode read it in place via stride_b_tok (or gather it in a mixed
+            # batch), so a copy here is one dead kernel launch per layer.
             beta = b.unsqueeze(0)
         else:
             q = self.q_proj(hidden_states)[0]
@@ -803,10 +806,8 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         spec_sequence_masks = attn_metadata_narrowed.spec_sequence_masks
-        if spec_sequence_masks is not None and self.fused_path:
-            raise NotImplementedError(
-                "SolarOpen2 fused KDA path does not support speculative decoding."
-            )
+        num_decodes = attn_metadata_narrowed.num_decodes
+        num_prefills = attn_metadata_narrowed.num_prefills
         has_initial_state = attn_metadata_narrowed.has_initial_state
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
         non_spec_state_indices_tensor = (
@@ -863,88 +864,117 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
                 2, cols.unsqueeze(1).expand(-1, window.size(1), -1)
             )
 
+        # The fused path convolves concat[q,k,v] in one launch, so it carries a
+        # single [n, 3*w] zero-copy view (_fused_qkv_view) and the split below
+        # gathers it once rather than three times on q/k/v, keeping each half a
+        # single conv input.
+        if self.fused_path:
+            proj_states: tuple[torch.Tensor, ...] = (
+                _fused_qkv_view(q_proj_states, k_proj_states, v_proj_states),
+            )
+        else:
+            proj_states = (q_proj_states, k_proj_states, v_proj_states)
+
         # Split the batch into the speculative part and the rest. q/k/v are
         # (tokens, dim) while g1 is (1, tokens, h, d) and beta is (1, tokens, h),
         # so they gather on different axes.
+        proj_spec: tuple[torch.Tensor, ...] | None
+        proj_ns: tuple[torch.Tensor, ...] | None
         if spec_sequence_masks is not None:
-            if (
-                attn_metadata_narrowed.num_prefills == 0
-                and attn_metadata_narrowed.num_decodes == 0
-            ):
-                q_spec, k_spec, v_spec = q_proj_states, k_proj_states, v_proj_states
-                g1_spec, beta_spec = g1, beta
-                q_ns = k_ns = v_ns = g1_ns = beta_ns = None
+            if num_prefills == 0 and num_decodes == 0:
+                # All-speculative batch: the split is the identity.
+                proj_spec, g1_spec, beta_spec = proj_states, g1, beta
+                proj_ns = g1_ns = beta_ns = None
             else:
                 assert spec_token_indx is not None
                 assert non_spec_token_indx is not None
-                q_spec = q_proj_states.index_select(0, spec_token_indx)
-                k_spec = k_proj_states.index_select(0, spec_token_indx)
-                v_spec = v_proj_states.index_select(0, spec_token_indx)
+                proj_spec = tuple(
+                    x.index_select(0, spec_token_indx) for x in proj_states
+                )
                 g1_spec = g1.index_select(1, spec_token_indx)
                 beta_spec = beta.index_select(1, spec_token_indx)
-                q_ns = q_proj_states.index_select(0, non_spec_token_indx)
-                k_ns = k_proj_states.index_select(0, non_spec_token_indx)
-                v_ns = v_proj_states.index_select(0, non_spec_token_indx)
+                proj_ns = tuple(
+                    x.index_select(0, non_spec_token_indx) for x in proj_states
+                )
                 g1_ns = g1.index_select(1, non_spec_token_indx)
                 beta_ns = beta.index_select(1, non_spec_token_indx)
         else:
-            q_spec = k_spec = v_spec = g1_spec = beta_spec = None
-            q_ns, k_ns, v_ns = q_proj_states, k_proj_states, v_proj_states
-            g1_ns, beta_ns = g1, beta
+            proj_spec = g1_spec = beta_spec = None
+            proj_ns, g1_ns, beta_ns = proj_states, g1, beta
 
         core_attn_out_spec = None
-        if spec_sequence_masks is not None:
+        spec_out = None
+        if proj_spec is not None:
             assert spec_state_indices_tensor is not None
             assert spec_query_start_loc is not None
-            assert q_spec is not None and k_spec is not None and v_spec is not None
             assert g1_spec is not None and beta_spec is not None
             q_spec, k_spec, v_spec = self._spec_qkv_conv(
-                q_spec, k_spec, v_spec, conv_state, attn_metadata_narrowed
+                proj_spec, conv_state, attn_metadata_narrowed
             )
             q_spec, k_spec, v_spec = map(
                 lambda x: rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim),
                 (q_spec, k_spec, v_spec),
             )
-            # fused_recurrent_kda takes a pre-gated g, while
-            # chunk_kda_with_fused_gate gates raw_g itself.
-            g1_spec = fused_kda_gate(
-                rearrange(g1_spec, "1 n h d -> n (h d)"),
-                self.A_log,
-                self.head_dim,
-                g_bias=self.dt_bias,
-            ).unsqueeze(0)
-            core_attn_out_spec, _ = fused_recurrent_kda(
-                q=q_spec,
-                k=k_spec,
-                v=v_spec,
-                g=g1_spec,
-                beta=beta_spec,
-                initial_state=recurrent_state,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-            )
+            if self.fused_path:
+                assert num_accepted_tokens is not None
+                # One fused gate+recurrent kernel over the 2-D state ladder,
+                # fed RAW g1 and RAW b logits like the fused decode below. An
+                # all-speculative batch owns every row, so the kernel writes
+                # straight into core_attn_out; a mixed batch is scattered below.
+                if proj_ns is None:
+                    spec_out = core_attn_out[:, : q_spec.size(1)]
+                core_attn_out_spec, _ = fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=rearrange(g1_spec, "1 n h d -> n h d"),
+                    b=beta_spec,
+                    dt_bias=self.dt_bias,
+                    q=q_spec,
+                    k=k_spec,
+                    v=v_spec,
+                    initial_state=recurrent_state,
+                    inplace_final_state=True,
+                    cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
+                    ssm_state_indices=spec_state_indices_tensor,
+                    num_accepted_tokens=num_accepted_tokens,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=True,
+                    neg_eigval=self.allow_neg_eigval,
+                    out=spec_out,
+                )
+            else:
+                # fused_recurrent_kda takes a pre-gated g, while
+                # chunk_kda_with_fused_gate gates raw_g itself.
+                g1_spec = fused_kda_gate(
+                    rearrange(g1_spec, "1 n h d -> n (h d)"),
+                    self.A_log,
+                    self.head_dim,
+                    g_bias=self.dt_bias,
+                ).unsqueeze(0)
+                core_attn_out_spec, _ = fused_recurrent_kda(
+                    q=q_spec,
+                    k=k_spec,
+                    v=v_spec,
+                    g=g1_spec,
+                    beta=beta_spec,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
+                    ssm_state_indices=spec_state_indices_tensor,
+                    num_accepted_tokens=num_accepted_tokens,
+                )
 
         core_attn_out_non_spec = None
-        if q_ns is not None:
-            assert k_ns is not None and v_ns is not None
+        if proj_ns is not None:
+            # All-speculative batches skip this branch entirely:
+            # non_spec_state_indices_tensor is None there.
             assert g1_ns is not None and beta_ns is not None
             if self.fused_path:
                 q, k, v = self._fused_qkv_conv(
-                    q_ns,
-                    k_ns,
-                    v_ns,
-                    conv_state,
-                    attn_metadata_narrowed,
+                    proj_ns[0], conv_state, attn_metadata_narrowed
                 )
             else:
                 q, k, v = self._unfused_qkv_conv(
-                    q_ns,
-                    k_ns,
-                    v_ns,
-                    conv_state,
-                    attn_metadata_narrowed,
+                    *proj_ns, conv_state, attn_metadata_narrowed
                 )
 
             q, k, v = map(
@@ -986,26 +1016,37 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             elif self.fused_path:
                 # Decode: single fused gate+recurrent kernel. Pass RAW g1 (a) and
                 # RAW b logits; the kernel applies softplus/-exp(A_log) gating and
-                # sigmoid(b)[*2] internally. Decode tokens live at the front of
-                # the non-spec batch and are written straight into core_attn_out.
+                # sigmoid(b)[*2] internally. With no prefills every token here is
+                # a decode token, possibly several per sequence.
                 assert non_spec_query_start_loc is not None
-                n_dec = attn_metadata_narrowed.num_decodes
+                # The decode tokens are core_attn_out's front rows only when no
+                # row is speculative; the builder turns decodes into prefills
+                # whenever a batch has speculative requests.
+                assert spec_sequence_masks is None
+                n_tok = q.size(1)
+                # The fused kernel writes straight into the front slice of
+                # core_attn_out (contiguous, B=1), skipping an extra output
+                # buffer + copy-back. Rows past the last real sequence
+                # (cudagraph padding) are not written and the model drops them.
+                # With 1-D ssm_state_indices the kernel stores the state after
+                # token t at indices[seq + t], so the state is only right at one
+                # token/seq.
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=rearrange(g1_ns, "1 n h d -> n h d")[:n_dec],
-                    b=beta_ns[:, :n_dec],
+                    a=rearrange(g1_ns, "1 n h d -> n h d"),
+                    b=beta_ns,
                     dt_bias=self.dt_bias,
-                    q=q[:, :n_dec],
-                    k=k[:, :n_dec],
-                    v=v[:, :n_dec],
+                    q=q,
+                    k=k,
+                    v=v,
                     initial_state=recurrent_state,
                     inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[: n_dec + 1],
+                    cu_seqlens=non_spec_query_start_loc[: num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                     is_kda=True,
                     neg_eigval=self.allow_neg_eigval,
-                    out=core_attn_out[:, :n_dec],
+                    out=core_attn_out[:, :n_tok],
                 )
                 return
             else:
@@ -1035,6 +1076,17 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
 
         if core_attn_out_spec is not None and core_attn_out_non_spec is not None:
             # Mixed batch: scatter both halves back to the batch's token order.
+            if self.fused_path:
+                # Both halves are dense in their own order and the two index
+                # sets together cover every real token (rows past them are
+                # padding), so scatter straight into core_attn_out.
+                core_attn_out[0].index_copy_(
+                    0, spec_token_indx, core_attn_out_spec[0]
+                )
+                core_attn_out[0].index_copy_(
+                    0, non_spec_token_indx, core_attn_out_non_spec[0]
+                )
+                return
             merged = torch.empty(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
                 dtype=core_attn_out_spec.dtype,
@@ -1044,6 +1096,9 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[0, :num_actual_tokens] = merged[0, :num_actual_tokens]
         elif core_attn_out_spec is not None:
+            if spec_out is not None:
+                # Already written in place.
+                return
             core_attn_out[0, :num_actual_tokens] = core_attn_out_spec[
                 0, :num_actual_tokens
             ]
@@ -1055,26 +1110,26 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
 
     def _spec_qkv_conv(
         self,
-        q_proj_states: torch.Tensor,
-        k_proj_states: torch.Tensor,
-        v_proj_states: torch.Tensor,
+        proj_states: tuple[torch.Tensor, ...],
         conv_state: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``proj_states`` is ``(qkv,)`` on the fused path, ``(q, k, v)``
+        otherwise."""
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor
         assert spec_state_indices_tensor is not None
         # The conv state lives in the first block of each request's ladder; the
-        # recurrent kernel takes the whole 2-D ladder instead.
+        # recurrent kernel takes the whole 2-D ladder instead. Swapping the two
+        # is silent: both are valid, in-bounds block ids.
         conv_indices = spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes]
         max_query_len = spec_state_indices_tensor.size(-1)
-        conv_state_q, conv_state_k, conv_state_v = conv_state.chunk(3, dim=-2)
 
-        def _conv(x, conv_state_chunk, conv1d):
+        def _conv(x, conv_state_chunk, weight, bias):
             return causal_conv1d_update(
                 x,
                 conv_state_chunk,
-                conv1d.weight.view(conv1d.weight.size(0), conv1d.weight.size(2)),
-                conv1d.bias,
+                weight.view(weight.size(0), weight.size(2)),
+                bias,
                 activation="silu",
                 conv_state_indices=conv_indices,
                 num_accepted_tokens=attn_metadata.num_accepted_tokens,
@@ -1085,30 +1140,43 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
                 validate_data=False,
             )
 
-        q = _conv(q_proj_states, conv_state_q, self.q_conv1d)
-        k = _conv(k_proj_states, conv_state_k, self.k_conv1d)
-        v = _conv(v_proj_states, conv_state_v, self.v_conv1d)
+        if self.fused_path:
+            # One conv over the whole conv_state with the merged q/k/v weight.
+            (qkv,) = proj_states
+            qkv = _conv(qkv, conv_state, self.conv1d.weight, self.conv1d.bias)
+            q, k, v = qkv.split(qkv.shape[-1] // 3, dim=-1)
+            return q, k, v
+
+        q_proj_states, k_proj_states, v_proj_states = proj_states
+        conv_state_q, conv_state_k, conv_state_v = conv_state.chunk(3, dim=-2)
+        q = _conv(
+            q_proj_states, conv_state_q, self.q_conv1d.weight, self.q_conv1d.bias
+        )
+        k = _conv(
+            k_proj_states, conv_state_k, self.k_conv1d.weight, self.k_conv1d.bias
+        )
+        v = _conv(
+            v_proj_states, conv_state_v, self.v_conv1d.weight, self.v_conv1d.bias
+        )
         return q, k, v
 
     def _fused_qkv_conv(
         self,
-        q_proj_states: torch.Tensor,
-        k_proj_states: torch.Tensor,
-        v_proj_states: torch.Tensor,
+        qkv: torch.Tensor,
         conv_state: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # ONE causal conv over concat[q,k,v] via the merged conv1d weight, then
-        # split. The conv input is a zero-copy strided view over the adjacent
-        # q/k/v slices of the fused in_proj output (_fused_qkv_view); the split
-        # yields strided views that the fused decode kernel reads in place.
+        # split. Without speculative rows the conv input is a zero-copy strided
+        # view over the adjacent q/k/v slices of the fused in_proj output
+        # (_fused_qkv_view); the split yields strided views that the fused
+        # decode kernel reads in place.
         qkv_conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        split_size = q_proj_states.shape[-1]
+        split_size = qkv.shape[-1] // 3
         state_indices = attn_metadata.non_spec_state_indices_tensor
         if attn_metadata.num_prefills > 0:
-            qkv = _fused_qkv_view(q_proj_states, k_proj_states, v_proj_states)
             qkv = causal_conv1d_fn(
                 qkv.transpose(0, 1),
                 qkv_conv_weights,
@@ -1122,13 +1190,29 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
             ).transpose(0, 1)
         else:
             assert state_indices is not None
+            num_decodes = attn_metadata.num_decodes
+            # One block id per sequence, not per token. A decode batch can
+            # carry several tokens per sequence (full cudagraph capture with
+            # speculative decoding enabled), and causal_conv1d_update infers its
+            # batch from x.shape[0] unless it is handed the sequence boundaries.
+            if qkv.size(0) == num_decodes:
+                decode_query_start_loc = None
+                decode_max_query_len = -1
+            else:
+                assert attn_metadata.non_spec_query_start_loc is not None
+                decode_query_start_loc = attn_metadata.non_spec_query_start_loc[
+                    : num_decodes + 1
+                ]
+                decode_max_query_len = self.num_spec + 1
             qkv = causal_conv1d_update(
-                _fused_qkv_view(q_proj_states, k_proj_states, v_proj_states),
+                qkv,
                 conv_state,
                 qkv_conv_weights,
                 self.conv1d.bias,
                 activation="silu",
-                conv_state_indices=state_indices[: attn_metadata.num_actual_tokens],
+                conv_state_indices=state_indices[:num_decodes],
+                query_start_loc=decode_query_start_loc,
+                max_query_len=decode_max_query_len,
                 validate_data=True,
             )
         q, k, v = qkv.split(split_size, dim=-1)

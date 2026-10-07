@@ -104,6 +104,31 @@ def test_kda_spec_decode_opt_in_is_a_registered_env_var():
     assert envs.VLLM_KDA_SPEC_DECODE is False, "must be off by default"
 
 
+@pytest.mark.parametrize("aiter_enabled", [True, False])
+@pytest.mark.parametrize("speculative", [True, False])
+def test_solar_open2_fused_kda_path_is_gated_by_platform_only(
+    monkeypatch, aiter_enabled, speculative
+):
+    """The fused KDA path implements the speculative branch itself, so it stays
+    on under speculative decoding. The attention layer and
+    SolarOpen2Model.load_weights both read this gate, and they have to agree
+    for the merged in_proj/conv1d params to be loaded."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.models import solar_open2
+
+    monkeypatch.setattr(
+        rocm_aiter_ops, "is_enabled", classmethod(lambda cls: aiter_enabled)
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=(
+            SimpleNamespace(method="dflash", num_speculative_tokens=7)
+            if speculative
+            else None
+        )
+    )
+    assert solar_open2._use_amd_fused_kda(vllm_config) is aiter_enabled
+
+
 def test_kda_guard_does_not_replace_hybrid_config_verification():
     """MODELS_CONFIG_MAP and the hybrid hook both run; ours must be additive."""
     from vllm.model_executor.models.config import (
@@ -454,23 +479,3 @@ def test_solar_open2_does_not_override_default_aux_layers():
         "get_eagle3_default_aux_hidden_state_layers"
         not in SolarOpen2ForCausalLM.__dict__
     )
-
-
-# ---------------------------------------------------------------------------
-# ROCm fused KDA path
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("aiter", "speculative_config", "expected"),
-    [(True, None, True), (True, object(), False), (False, None, False)],
-)
-def test_amd_fused_kda_path_is_off_under_speculative_decoding(
-    monkeypatch, aiter, speculative_config, expected
-):
-    """The fused projection/conv path has no speculative state handling."""
-    from vllm.model_executor.models import solar_open2
-
-    monkeypatch.setattr(solar_open2.rocm_aiter_ops, "is_enabled", lambda: aiter)
-    vllm_config = SimpleNamespace(speculative_config=speculative_config)
-    assert solar_open2._use_amd_fused_kda(vllm_config) is expected
