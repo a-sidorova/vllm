@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
+    VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND: str = "auto"
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1382,6 +1383,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
         in ("true", "1")
+    ),
+    # Kernel family aiter unified attention dispatches to in the
+    # ROCM_AITER_UNIFIED_ATTN backend. "auto" lets aiter pick (Gluon on
+    # gfx950/gfx1250, Triton elsewhere); "triton" / "gluon" force one.
+    "VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND": env_with_choices(
+        "VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND",
+        "auto",
+        ["auto", "triton", "gluon"],
+        case_sensitive=False,
     ),
     # Whether to use aiter fusion shared experts ops.
     # By default is disabled.

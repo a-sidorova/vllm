@@ -6,6 +6,7 @@ from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import IS_AITER_FOUND, rocm_aiter_ops
 from vllm.config import get_current_vllm_config_or_none
@@ -178,8 +179,13 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             kv_sharing_target_layer_name,
             sinks,
         )
+        backend = envs.VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND.lower()
+        # None lets aiter pick its arch default
+        self.unified_attention_backend = None if backend == "auto" else backend
         logger.info_once(
-            "Using aiter unified attention for RocmAiterUnifiedAttentionImpl"
+            "Using aiter unified attention for RocmAiterUnifiedAttentionImpl "
+            "(backend=%s)",
+            backend,
         )
         from aiter.ops.triton.unified_attention import unified_attention
 
@@ -293,6 +299,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 v_descale=layer._v_scale,
                 sinks=self.sinks,
                 output_scale=output_scale,
+                backend=self.unified_attention_backend,
             )
         else:
             # The aiter kernel is causal-only. Non-causal cross-attention
