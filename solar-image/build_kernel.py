@@ -1,26 +1,20 @@
 """Compile AITER JIT modules at image-build time, with no GPU attached.
 
-    python3 build_kernel.py module_fused_moe_router module_gemm_a8w8
+    python3 build_kernel.py module_fused_moe_router
 
 module_fused_moe_router: without this the kernel JITs on the first decode
 batch (~35 s) inside the first request, and because that write lands in the
 *container's* writable layer rather than the image, every fresh container pays
 it again. One .so holds both the MXFP4 and the FP8 per-token kernels.
 
-module_gemm_a8w8: the tuned table (AITER_CONFIG_GEMM_A8W8) is compiled into
-the .so as a lookup map, and the base image ships one prebuilt from AITER's
-stock table. An existing .so is never rebuilt when the env var changes, so
-without this the FP8 linears would silently run the stock table's kernels.
-
 Two things on the `import aiter` path want a device. Both are worked around
 here rather than patched into aiter:
 
-  * chip_info._detect_native() shells out to rocminfo    -> GPU_ARCHS pins it
+  * chip_info shells out to rocminfo. GPU_ARCHS covers get_gfx(), but
+    get_gfx_runtime() - which aiter.utility.dtypes calls at import - ignores
+    it by design                                         -> fake rocminfo
   * triton's arch_info probes the active driver and, on failure, falls back to
     jax, which is not installed                          -> stub that module
-
-GPU_ARCHS also pins the build target the a8w8 codegen filters the tuned table
-by (gfx950 -> cu_num 256).
 
 Only compilation happens here; no kernel is executed, which is what makes it
 safe without a GPU. Run under the arch the image targets.
@@ -28,12 +22,32 @@ safe without a GPU. Run under the arch the image targets.
 
 import inspect
 import os
+import stat
 import sys
+import tempfile
 import time
 import types
 
 ARCH = os.environ.setdefault("GPU_ARCHS", "gfx950")
+CU_NUM = os.environ.get("SOLAR_CU_NUM", "256")
 MD_NAMES = sys.argv[1:] or ["module_fused_moe_router"]
+
+# One GPU agent in rocminfo's layout: chip_info parses the 2-space-indented
+# Name / Device Type / ASIC Revision / Compute Unit keys. AITER finds rocminfo
+# with shutil.which, so it only has to come first on PATH.
+_bin = tempfile.mkdtemp(prefix="fake-rocminfo-")
+with open(os.path.join(_bin, "rocminfo"), "w") as f:
+    f.write(
+        "#!/bin/sh\ncat <<'EOF'\n"
+        "Agent 1\n"
+        f"  Name:                    {ARCH.split(';')[-1]}\n"
+        "  Device Type:             GPU\n"
+        "  ASIC Revision:           0(0x0)\n"
+        f"  Compute Unit:            {CU_NUM}\n"
+        "EOF\n"
+    )
+os.chmod(os.path.join(_bin, "rocminfo"), stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+os.environ["PATH"] = _bin + os.pathsep + os.environ["PATH"]
 
 # Minimal stand-in for jax._src.lib.gpu_triton. get_arch_details is the only
 # thing called, and only to produce an arch string we already know.

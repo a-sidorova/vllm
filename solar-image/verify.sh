@@ -47,11 +47,12 @@ from vllm._aiter_ops import rocm_aiter_ops
 print(f"has_fused_moe_router()     {rocm_aiter_ops.has_fused_moe_router()}")
 print(f"is_fused_router_enabled()  {rocm_aiter_ops.is_fused_router_enabled()}")
 
-# Model Runner V2 rejects SolarOpen2TemplateLogitsProcessor at startup.
+# The image leaves the runner to vLLM, which picks Model Runner V2. Only a
+# launch with the V1-interface SolarOpen2TemplateLogitsProcessor sets it to 0.
 import vllm.envs as envs
 print(f"VLLM_USE_V2_MODEL_RUNNER   {envs.VLLM_USE_V2_MODEL_RUNNER}")
-assert envs.VLLM_USE_V2_MODEL_RUNNER is False, \
-    "VLLM_USE_V2_MODEL_RUNNER must be 0 for the Solar logits processor"
+assert envs.VLLM_USE_V2_MODEL_RUNNER is not False, \
+    "VLLM_USE_V2_MODEL_RUNNER=0 is set: the image must not force Model Runner V1"
 
 # The Solar-Open2 decode shapes: bf16 in, MXFP4 or FP8 per-token experts.
 from aiter import ActivationType, QuantType, dtypes
@@ -104,14 +105,19 @@ assert "apply_monolithic" in QuarkW8A8Fp8MoEMethod.__dict__, \
     "QuarkW8A8Fp8MoEMethod.apply_monolithic missing"
 print(f"FP8 engine path            oracle + {_rocm_aiter_fused_router_quant_method.__name__} + Quark apply_monolithic")
 
-# The tuned a8w8 table only takes effect if module_gemm_a8w8.so was rebuilt
-# from it at image build; a stale prebuilt .so would load without complaint.
+# The router must be compiled into the image, or every fresh container JITs it
+# inside its first decode batch.
 import os
 from aiter.jit import core
-so = os.path.join(core.get_user_jit_dir(), "module_gemm_a8w8.so")
-print(f"AITER_CONFIG_GEMM_A8W8     {os.environ.get('AITER_CONFIG_GEMM_A8W8')}")
-print(f"module_gemm_a8w8.so        {os.path.getsize(so)} bytes")
-assert os.path.getmtime(so) >= os.path.getmtime(os.environ["AITER_CONFIG_GEMM_A8W8"]), \
-    "module_gemm_a8w8.so is older than the a8w8 table it should be built from"
+so = os.path.join(core.get_user_jit_dir(), "module_fused_moe_router.so")
+assert os.path.isfile(so), f"{so} missing: the router was not compiled in"
+print(f"module_fused_moe_router.so {os.path.getsize(so)} bytes")
+
+# AITER resolves the bf16 table once, at import.
+from aiter.jit.core import AITER_CONFIGS
+bf16 = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
+print(f"AITER_CONFIG_GEMM_BF16     {bf16}")
+assert os.environ["AITER_CONFIG_GEMM_BF16"] in bf16, \
+    f"AITER does not read the tuned bf16 table: {bf16}"
 print("\nOK")
 PY
