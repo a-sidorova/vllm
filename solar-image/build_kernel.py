@@ -1,11 +1,16 @@
 """Compile AITER JIT modules at image-build time, with no GPU attached.
 
-    python3 build_kernel.py module_fused_moe_router
+    python3 build_kernel.py module_fused_moe_router module_gemm_a8w8
 
 module_fused_moe_router: without this the kernel JITs on the first decode
 batch (~35 s) inside the first request, and because that write lands in the
 *container's* writable layer rather than the image, every fresh container pays
 it again. One .so holds both the MXFP4 and the FP8 per-token kernels.
+
+module_gemm_a8w8: the tuned a8w8 table is compiled into this .so (the codegen
+reads AITER_CONFIG_GEMM_A8W8), and AITER never rebuilds an existing .so, so a
+changed table only takes effect by rebuilding it here. The codegen keeps the
+rows for the build target alone (GPU_ARCHS, and CU_NUM if set).
 
 Two things on the `import aiter` path want a device. Both are worked around
 here rather than patched into aiter:

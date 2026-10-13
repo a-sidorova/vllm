@@ -5,7 +5,7 @@ vLLM ROCm image for Solar-Open2 on MI355X:
 > Baseline + eliminated element-wise small kernels + fused MoE-router kernel
 > (`VLLM_ROCM_USE_AITER_FUSED_ROUTER=1`, ROCm/aiter#5150) for **MXFP4 and FP8
 > per-token** experts + DFlash and fused KDA under speculative decoding +
-> tuned bf16 GEMMs for the 250B at TP4.
+> tuned GEMMs for the 250B at TP4 (bf16) and the 35B FP8 at TP1 (a8w8).
 
 Built from the current heads of the two branches:
 
@@ -32,7 +32,7 @@ Self-contained: engine, router kernel and tuning are all in the image.
 | Engine remote | `github.com/UpstageAI/upstage-vllm-amd` (**private**) |
 | Router | ROCm/aiter#5150 + hidden 2048 + FP8 per-token mode @ `9689185d3` (4 commits on `v0.1.23`, `50da036ac`) |
 | Router remote | `github.com/sshlyapn/aiter`, branch `sshliapn/feature/fused_router_0.1.23` |
-| Tuning | `tuning/bf16_tuned_gemms_250b_tp4.csv` (bf16 GEMMs only) |
+| Tuning | `tuning/bf16_tuned_gemms_250b_tp4.csv`, `tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv` (see §Tuning) |
 | Target arch | `gfx950` (MI355X only) |
 | AITER / flydsl | `0.1.23` / `0.3.4.1` — not reinstalled |
 
@@ -61,7 +61,7 @@ pinned commits, and only goes to the network otherwise:
   `v0.1.23` by SHA from `github.com/sshlyapn/aiter`.
 
 It pins both revisions by commit, checks that the router commits touch exactly
-the nine overlay files and md5-checks them, and md5-checks the tuning CSV, so it
+the nine overlay files and md5-checks them, and md5-checks the tuning CSVs, so it
 either reproduces the exact intended inputs or fails loudly. It also writes
 `aiter-overlay/stock.md5`: what the five files the router *modifies* hash to at
 `v0.1.23`. `docker build` checks the base image's installed copies against it
@@ -73,8 +73,8 @@ To build from newer commits on either branch, update `VLLM_COMMIT` /
 router branch stays on `v0.1.23` and only touches those nine files, nothing
 else changes; if it touches another file, `fetch-sources.sh` says which.
 
-Outside Docker on a 256-core host: ~4 min for `_rocm_C` and ~35 s for the
-router.
+Outside Docker on a 256-core host: ~4 min for `_rocm_C`, ~35 s for the
+router and ~11.5 min for `module_gemm_a8w8` (379 shapes, 189 MB).
 
 ## Verify
 
@@ -104,7 +104,10 @@ Check (1) launches nothing. It asserts:
 - the FP8 engine path is present: the FP8 oracle offers
   `AiterFusedRouterExperts`, and `QuarkW8A8Fp8MoEMethod` has `apply_monolithic`;
 - `module_fused_moe_router.so` is compiled in, and AITER resolves
-  `AITER_CONFIG_GEMM_BF16` to the baked-in table.
+  `AITER_CONFIG_GEMM_BF16` to the baked-in table;
+- AITER resolves `AITER_CONFIG_GEMM_A8W8` to the baked-in 35B FP8 table, and
+  `module_gemm_a8w8.so` is newer than that table, i.e. was built from it rather
+  than being the base image's stock copy.
 
 Check (2) launches the router at two decode shapes — MXFP4 250B (hidden 4096,
 80 experts, topk 7) and FP8 35B (hidden 2048, 128 experts, topk 4) — and
@@ -173,30 +176,48 @@ those two changes, it passes all 12 suites.
 
 ### Tuning
 
-Baked into `/tuning`, with the env var preset — nothing to mount:
+Baked into `/tuning` — nothing to mount. Named
+`<kind>_tuned_gemms_<checkpoint>_tp<N>.csv`:
 
-| Env var | File | Contents |
-|---|---|---|
-| `AITER_CONFIG_GEMM_BF16` | `bf16_tuned_gemms_250b_tp4.csv` | 504 rows, gfx950 / 256 CUs only: the bf16 GEMMs of the 250B at TP4. Same schema as AITER's stock `configs/bf16_tuned_gemm.csv`, which it replaces wholesale. Kernels: flydsl, hipBLASLt, torch, triton, asm, skinny. |
+| File | Env var | Preset | Contents |
+|---|---|---|---|
+| `bf16_tuned_gemms_250b_tp4.csv` | `AITER_CONFIG_GEMM_BF16` | yes | 504 rows, 8 N/K pairs, gfx950 / 256 CUs only: the bf16 GEMMs of the 250B at TP4. Kernels: flydsl, hipBLASLt, torch, triton, asm, skinny. |
+| `a8w8_tuned_gemms_35b_fp8_tp1.csv` | `AITER_CONFIG_GEMM_A8W8` | yes, compiled in | 379 rows, gfx950 / 256 CUs only: every FP8 a8w8 linear of the 35B FP8 at TP1 — N/K (2566, 2048), (3072, 128), (3072, 2048), (4096, 2048), (4876, 2048), (9496, 2048). |
 
-The table is read at runtime: point `AITER_CONFIG_GEMM_BF16` elsewhere to
-override, no rebuild needed. Shapes outside it fall back to AITER's heuristics
-— including every bf16 GEMM of the 35B checkpoints, since the stock table is
-replaced, not extended. To keep both, give AITER a colon-separated list
-(`-e AITER_CONFIG_GEMM_BF16=/tuning/bf16_tuned_gemms_250b_tp4.csv:/path/to/other.csv`);
-it merges them on start.
+Both share the schema of AITER's stock `configs/bf16_tuned_gemm.csv` /
+`configs/a8w8_tuned_gemm.csv` and replace the stock table wholesale.
 
-`AITER_CONFIG_FMOE` and `AITER_CONFIG_GEMM_A8W8` are unset, so the MoE and
-a8w8 GEMMs use AITER's stock tables. `AITER_CONFIG_FMOE` can be pointed at a
-mounted table at runtime. `AITER_CONFIG_GEMM_A8W8` cannot: AITER compiles that
-table into `module_gemm_a8w8.so` and never rebuilds an existing `.so` when the
-variable changes. To change it, add the CSV under `tuning/` and rebuild that
-module in step 5 (`build_kernel.py module_gemm_a8w8`).
+**bf16** is read at runtime: point `AITER_CONFIG_GEMM_BF16` elsewhere to
+override, no rebuild needed. Shapes outside the table fall back to AITER's
+heuristics, since the stock table is replaced, not extended. To combine
+tables, give AITER a colon-separated list
+(`-e AITER_CONFIG_GEMM_BF16=/tuning/a.csv:/path/to/b.csv`); it merges them on
+start.
 
-The build fails if the bf16 table does not parse, differs in schema from
+The 35B bf16 GEMMs are not tuned. Their shapes — N/K (2048, 3072), (2048,
+2048), (2048, 1024), (128, 2048), (196608, 2048) — are in neither the 250B
+table nor AITER's stock one, so they run on AITER's default kernels whichever
+is selected.
+
+**a8w8** is compiled into `module_gemm_a8w8.so` (step 5), and AITER never
+rebuilds an existing `.so` when the variable changes, so it is preset and must
+not be pointed elsewhere at runtime: the Python side would then read splitK
+from a table the compiled kernels do not match. To change it, replace the CSV
+under `tuning/` and rebuild. The 35B FP8 *requires* it: its KDA `in_proj`
+(N=9496, not a multiple of 16) has no untuned fallback — without a tuned entry
+AITER hands it to `torch._scaled_mm`, which rejects it, and the server fails to
+start. MXFP4 checkpoints run no a8w8 GEMMs and are unaffected.
+
+`AITER_CONFIG_FMOE` is unset, so the MoE configs are AITER's stock table; it
+can be pointed at a mounted table at runtime.
+
+The build fails if either table does not parse, differs in schema from
 AITER's, has null cells, has duplicate index rows (which would make the lookup
-arbitrary), names an unknown kernel library, or carries rows for any target
-other than gfx950 / 256 CUs.
+arbitrary), or carries rows for any target other than gfx950 / 256 CUs (for
+a8w8 the codegen would silently drop those rows); if the bf16 table names an
+unknown kernel library; if the a8w8 table has a weight dtype other than fp8;
+and if the number of shapes compiled into `module_gemm_a8w8` differs from the
+a8w8 table's row count.
 
 ### Model runner
 
@@ -225,9 +246,10 @@ prefills.
 | `Dockerfile` | the build | `docker build` |
 | `fetch-sources.sh` | writes `vllm-src/` + `aiter-overlay/` from the pinned commits | before build |
 | `.dockerignore` | keeps `.git` and `__pycache__` out of the context | `docker build` |
-| `tuning/bf16_tuned_gemms_250b_tp4.csv` | AITER bf16 GEMM config, copied to `/tuning` | in build, step 4b |
-| `tuning_check.py` | validates the CSV against AITER's schema | in build, step 4b |
-| `build_kernel.py` | compiles the router into the image | in build, step 5 |
+| `tuning/bf16_tuned_gemms_250b_tp4.csv` | AITER bf16 GEMM config, 250B TP4, copied to `/tuning` | in build, step 4b |
+| `tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv` | AITER a8w8 GEMM config, 35B FP8 TP1, copied to `/tuning` | in build, steps 4b and 5 |
+| `tuning_check.py` | validates the CSVs against AITER's schemas | in build, step 4b |
+| `build_kernel.py` | compiles the router and the a8w8 GEMM into the image | in build, step 5 |
 | `verify.sh` | baked in as `verify-fused-router` | after build, GPU |
 | `router_smoke.py` | real kernel launches, MXFP4 and FP8 | after build, GPU |
 
@@ -283,10 +305,17 @@ fp8 / `[M, 1]` fp32 input. The 2-stage path takes it via `a1_prequant`. The
 `f8_f8 … silu_per_token` CK 2-stage modules — ship prebuilt in the base image,
 so they add no first-call JIT.
 
-**Kernel (step 5).** `module_fused_moe_router` is compiled into an image layer.
+**Kernels (step 5).** `module_fused_moe_router` is compiled into an image layer.
 AITER would otherwise JIT it on the first decode batch (~35 s). That write
 lands in the *container's* writable layer, not the image, so every fresh
 container pays it again, inside its first request.
+
+`module_gemm_a8w8` is rebuilt in the same step, for a different reason: the
+base image ships it prebuilt from AITER's stock a8w8 table, and the codegen
+(`gen_instances.py --tune_file $AITER_CONFIG_GEMM_A8W8`) only runs when the
+`.so` is missing. The build keeps only rows for the build target (`GPU_ARCHS`
+→ gfx950 / 256 CUs), so it counts the `{"gfx950", 256, …}` entries in the
+generated `gemm_a8w8_lookup.h` and fails unless all 379 rows made it in.
 
 No GPU is required because only the compile runs, never a kernel. Two device
 probes on the `import aiter` path are stubbed in `build_kernel.py`:
@@ -336,8 +365,8 @@ the `.cu` by hand with `hipcc` fails on `torch/all.h` unless you add
 ## Reproducibility
 
 Every input is pinned: both sources by commit, the base image by digest, the
-nine router files, the five stock files they replace, and the tuning CSV
-md5-checked.
+nine router files, the five stock files they replace, and the two tuning
+CSVs md5-checked.
 
 Compiled *outputs* are not bit-reproducible — the HIP compiler is
 nondeterministic. Two builds of the 8 Sep image from identical sources produced

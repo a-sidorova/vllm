@@ -119,5 +119,17 @@ bf16 = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
 print(f"AITER_CONFIG_GEMM_BF16     {bf16}")
 assert os.environ["AITER_CONFIG_GEMM_BF16"] in bf16, \
     f"AITER does not read the tuned bf16 table: {bf16}"
+
+# The a8w8 table is compiled into module_gemm_a8w8.so; one built before the
+# table landed would be the base image's stock build.
+a8w8 = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
+print(f"AITER_CONFIG_GEMM_A8W8     {a8w8}")
+assert os.environ["AITER_CONFIG_GEMM_A8W8"] in a8w8, \
+    f"AITER does not read the tuned a8w8 table: {a8w8}"
+so = os.path.join(core.get_user_jit_dir(), "module_gemm_a8w8.so")
+assert os.path.isfile(so), f"{so} missing: the a8w8 GEMM was not compiled in"
+print(f"module_gemm_a8w8.so        {os.path.getsize(so)} bytes")
+assert os.path.getmtime(so) >= os.path.getmtime(os.environ["AITER_CONFIG_GEMM_A8W8"]), \
+    "module_gemm_a8w8.so is older than the a8w8 table it should be built from"
 print("\nOK")
 PY

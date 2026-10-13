@@ -1,2 +1,4 @@
 vllm-src/
 aiter-overlay/
+# The repo ignores *.csv; the tuning tables are build inputs.
+!tuning/*.csv

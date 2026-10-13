@@ -1,6 +1,7 @@
 # Solar-Open2 v0.31.0 image: the Solar-Open2 port onto vLLM v0.31.0 (fused MoE
 # router for MXFP4 and FP8 per-token experts, DFlash, fused KDA under
-# speculative decoding) plus the 250B TP4 bf16 GEMM tuning.
+# speculative decoding) plus the 250B TP4 bf16 GEMM tuning and the 35B FP8 TP1
+# a8w8 GEMM tuning.
 #
 # Base: stock vllm/vllm-openai-rocm:v0.31.0. AITER and flydsl are NOT replaced -
 # the router is injected as a nine-file overlay onto the AITER the image already
@@ -136,20 +137,29 @@ COPY verify.sh /usr/local/bin/verify-fused-router
 RUN chmod +x /usr/local/bin/verify-fused-router
 
 # ---------------------------------------------------------------------------
-# 4b. Tuned bf16 GEMMs for the 250B at TP4 (gfx950 / 256 CUs). Read at
-#     runtime, so pointing AITER_CONFIG_GEMM_BF16 elsewhere needs no rebuild.
-#     It replaces AITER's stock bf16 table wholesale.
+# 4b. Tuned GEMM configs.
 #
-#     The MoE and a8w8 tables are AITER's stock ones: AITER_CONFIG_FMOE and
-#     AITER_CONFIG_GEMM_A8W8 are left unset, and module_gemm_a8w8.so stays the
-#     base image's prebuilt copy.
+#     bf16: the 250B TP4 table. Read at runtime, so pointing
+#     AITER_CONFIG_GEMM_BF16 elsewhere needs no rebuild. It replaces AITER's
+#     stock bf16 table wholesale. The 35B bf16 GEMMs are not tuned: neither
+#     this table nor the stock one has their shapes, so they run on AITER's
+#     default kernels either way.
+#
+#     a8w8: the 35B FP8 table (every a8w8 linear of that checkpoint, gfx950 /
+#     256 CUs). It is compiled into module_gemm_a8w8.so in step 5, so the env
+#     var is preset to it and overriding it means rebuilding that module (see
+#     README). Only FP8 checkpoints run a8w8 GEMMs; the MXFP4 ones run none.
+#
+#     The MoE table is AITER's stock one: AITER_CONFIG_FMOE is left unset.
 # ---------------------------------------------------------------------------
-COPY tuning/bf16_tuned_gemms_250b_tp4.csv /tuning/
+COPY tuning/bf16_tuned_gemms_250b_tp4.csv \
+     tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv /tuning/
 COPY tuning_check.py /tmp/tuning_check.py
 RUN set -eu; \
     python3 /tmp/tuning_check.py ${SITE_PACKAGES}; \
     rm -f /tmp/tuning_check.py
 ENV AITER_CONFIG_GEMM_BF16=/tuning/bf16_tuned_gemms_250b_tp4.csv
+ENV AITER_CONFIG_GEMM_A8W8=/tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv
 
 # The router only engages when both are set; the oracles gate on the second.
 ENV VLLM_ROCM_USE_AITER=1
@@ -160,22 +170,38 @@ RUN printf '%s\n' \
     'router: ROCm/aiter#5150 + hidden 2048 + FP8 per-token (9689185d3) overlay on amd-aiter 0.1.23 (flydsl 0.3.4.1)' \
     'PYTORCH_ROCM_ARCH: gfx950' \
     'AITER_CONFIG_GEMM_BF16: /tuning/bf16_tuned_gemms_250b_tp4.csv (250B TP4)' \
-    'AITER_CONFIG_FMOE, AITER_CONFIG_GEMM_A8W8: AITER stock' \
+    'AITER_CONFIG_GEMM_A8W8: /tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv (compiled into module_gemm_a8w8.so)' \
+    'AITER_CONFIG_FMOE: AITER stock' \
     'VLLM_USE_V2_MODEL_RUNNER: unset (vLLM picks Model Runner V2)' \
     >> /app/versions.txt
 
 # ---------------------------------------------------------------------------
-# 5. Compile module_fused_moe_router into the image. Otherwise it JITs on the
-#    first decode batch (~35 s) inside the first request, and since that write
-#    lands in the container's writable layer, not the image, every fresh
-#    container pays it again. One .so holds the MXFP4 and FP8 kernels.
+# 5. Compile into the image:
+#
+#    module_fused_moe_router - otherwise it JITs on the first decode batch
+#    (~35 s) inside the first request, and since that write lands in the
+#    container's writable layer, not the image, every fresh container pays it
+#    again. One .so holds the MXFP4 and FP8 kernels.
+#
+#    module_gemm_a8w8 - the base image ships it prebuilt from AITER's stock
+#    a8w8 table, and an existing .so is not rebuilt when
+#    AITER_CONFIG_GEMM_A8W8 changes. Rebuilt here from the table above; the
+#    lookup-header count proves every tuned row made it in, since the codegen
+#    silently drops rows for any other (gfx, cu_num).
 #
 #    Compiling needs no GPU: only the build runs here, never a kernel. See
 #    build_kernel.py for the two device probes that have to be stubbed.
 # ---------------------------------------------------------------------------
 COPY build_kernel.py /tmp/build_kernel.py
 RUN set -eu; \
-    GPU_ARCHS=${SOLAR_ROCM_ARCH} python3 /tmp/build_kernel.py module_fused_moe_router; \
+    GPU_ARCHS=${SOLAR_ROCM_ARCH} python3 /tmp/build_kernel.py \
+        module_fused_moe_router module_gemm_a8w8; \
     test -f ${SITE_PACKAGES}/aiter/jit/module_fused_moe_router.so; \
+    test -f ${SITE_PACKAGES}/aiter/jit/module_gemm_a8w8.so; \
+    want=$(python3 -c "import pandas as pd; print(len(pd.read_csv('${AITER_CONFIG_GEMM_A8W8}')))"); \
+    got=$(grep -c '{"gfx950", 256, ' ${SITE_PACKAGES}/aiter/jit/build/module_gemm_a8w8/blob/gemm_a8w8_lookup.h || true); \
+    [ "$got" = "$want" ] || { echo "module_gemm_a8w8: $got tuned shapes compiled in, want $want" >&2; exit 1; }; \
+    echo "module_gemm_a8w8: $got tuned shapes compiled in"; \
     rm -f /tmp/build_kernel.py; \
-    rm -rf ${SITE_PACKAGES}/aiter/jit/build/module_fused_moe_router
+    rm -rf ${SITE_PACKAGES}/aiter/jit/build/module_fused_moe_router \
+           ${SITE_PACKAGES}/aiter/jit/build/module_gemm_a8w8
