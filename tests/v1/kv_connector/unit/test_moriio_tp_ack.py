@@ -22,6 +22,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
     MoRIIOWrapper,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_stats import (
+    MoRIIOKVConnectorStats,
+)
 
 
 def test_remote_tp_rank_same_tp_maps_to_self():
@@ -312,6 +315,8 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
     # Load-error bookkeeping cleared alongside a completed transfer.
     worker._recving_local_blocks = {}
     worker._invalid_block_ids = set()
+    worker.xfer_stats = MoRIIOKVConnectorStats()
+    worker._read_xfers = {}
 
     assert worker._pop_done_transfers() == {"tx-release"}
     assert worker.moriio_wrapper.sent == [
@@ -411,6 +416,8 @@ def test_read_completion_waits_for_every_posted_read():
     worker._recving_transfers_start = {"req": float("inf")}
     worker._recving_local_blocks = {"req": [1, 2]}
     worker._invalid_block_ids = set()
+    worker.xfer_stats = MoRIIOKVConnectorStats()
+    worker._read_xfers = {}
 
     assert worker._pop_done_transfers() == set()
     assert "req" in worker._recving_transfers

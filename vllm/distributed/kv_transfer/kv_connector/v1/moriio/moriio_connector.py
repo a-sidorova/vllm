@@ -24,6 +24,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ROLE,
     EngineId,
@@ -68,6 +74,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
     is_mla_cache_layer,
     iter_layer_registration_regions,
     kda_conv_ssm,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_stats import (
+    MoRIIOKVConnectorStats,
+    MoRIIOPromMetrics,
+    MoRIIOReadXfer,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
@@ -352,6 +363,33 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is None:
             return set()
         return self.connector_worker.get_block_ids_with_load_errors()
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.get_kv_connector_stats()
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        return (
+            MoRIIOKVConnectorStats(data=data)
+            if data is not None
+            else MoRIIOKVConnectorStats()
+        )
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return MoRIIOPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -1710,6 +1748,12 @@ class MoRIIOConnectorWorker:
         # wrapped by the attention KV-transfer decorator, so wait_for_layer_load
         # never fires for them and these must be awaited in start_load_kv.
         self._mamba_reads_this_step: list = []
+        # Transfer telemetry. Posted bytes/segments are running totals that
+        # _read_blocks diffs around one request's posts.
+        self.xfer_stats = MoRIIOKVConnectorStats()
+        self._read_xfers: dict[ReqId, MoRIIOReadXfer] = {}
+        self._read_bytes_posted = 0
+        self._read_descs_posted = 0
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -2714,10 +2758,36 @@ class MoRIIOConnectorWorker:
                 layer_name,
                 exc_info=True,
             )
+        self._observe_read_completions()
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if not self.xfer_stats.is_empty():
+            return self.xfer_stats.clone_and_reset()
+        return None
+
+    def _observe_read_completions(self) -> None:
+        """Record every tracked READ whose statuses have all succeeded.
+
+        Failed statuses stay pending; _pop_done_transfers accounts for them.
+        """
+        if not self._read_xfers:
+            return
+        now = time.perf_counter()
+        for req_id, xfer in list(self._read_xfers.items()):
+            xfer.pending = [status for status in xfer.pending if not status.Succeeded()]
+            if not xfer.pending:
+                self.xfer_stats.record_transfer(
+                    now - xfer.start,
+                    xfer.post_duration,
+                    xfer.num_bytes,
+                    xfer.num_descriptors,
+                )
+                del self._read_xfers[req_id]
 
     def _pop_done_transfers(self) -> set[str]:
         done_req_ids: set[str] = set()
         _xfer_timeout = self.moriio_config.recv_abort_timeout
+        self._observe_read_completions()
         with self.moriio_wrapper.lock:
             to_remove = []
             for req_id, status_by_layer in self._recving_transfers.items():
@@ -2731,6 +2801,15 @@ class MoRIIOConnectorWorker:
                 ]
                 state = self.moriio_wrapper.poll_transfer_batch(statuses)
                 if statuses and state is TransferBatchState.DONE:
+                    # Completed after _observe_read_completions polled it.
+                    xfer = self._read_xfers.pop(req_id, None)
+                    if xfer is not None:
+                        self.xfer_stats.record_transfer(
+                            time.perf_counter() - xfer.start,
+                            xfer.post_duration,
+                            xfer.num_bytes,
+                            xfer.num_descriptors,
+                        )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(
@@ -2754,6 +2833,7 @@ class MoRIIOConnectorWorker:
                         failed_status.Code() if failed_status else "unknown",
                     )
                     self._record_failed_recv(req_id)
+                    self.xfer_stats.record_failed_transfer()
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
                         self.moriio_wrapper.send_notify(
@@ -2764,6 +2844,7 @@ class MoRIIOConnectorWorker:
                             message_fields={"consumer_tp_size": self.world_size},
                         )
                     except Exception:
+                        self.xfer_stats.record_failed_notification()
                         logger.exception(
                             "Failed to send error notification for request %s",
                             req_id,
@@ -2787,12 +2868,14 @@ class MoRIIOConnectorWorker:
                             _xfer_timeout,
                         )
                         self._record_failed_recv(req_id)
+                        self.xfer_stats.record_failed_transfer()
                         to_remove.append(req_id)
             for req_id in to_remove:
                 del self._recving_transfers[req_id]
                 del self._recving_transfers_callback_addr[req_id]
                 self._recving_transfers_start.pop(req_id, None)
                 self._recving_local_blocks.pop(req_id, None)
+                self._read_xfers.pop(req_id, None)
 
             return done_req_ids
 
@@ -2827,6 +2910,7 @@ class MoRIIOConnectorWorker:
         else:
             statuses = mamba_statuses
         if not statuses:
+            self._observe_read_completions()
             return
         try:
             self.moriio_wrapper.waiting_for_transfer_complete(statuses)
@@ -2841,6 +2925,7 @@ class MoRIIOConnectorWorker:
                 "MoRIIO reads did not complete before the forward; proceeding "
                 "to transfer cleanup."
             )
+        self._observe_read_completions()
 
     def _record_failed_recv(self, req_id: ReqId) -> None:
         """Hand a failed attention-only read to scheduler recovery.
@@ -3545,6 +3630,8 @@ class MoRIIOConnectorWorker:
                 break
             time.sleep(_backoff)
             _backoff = min(_backoff * 2, _SQ_FULL_BACKOFF_MAX_S)
+        self._read_bytes_posted += sum(sizes)
+        self._read_descs_posted += len(sizes)
         return transfer_status
 
     @staticmethod
@@ -3646,6 +3733,9 @@ class MoRIIOConnectorWorker:
 
         # SQ-full backpressure deadline, shared across this request's layers.
         _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        xfer_start = time.perf_counter()
+        bytes_before = self._read_bytes_posted
+        descs_before = self._read_descs_posted
         # TODO: apply multi-session batch-read when MoRIIO supports it.
         for layer_name in self.layer_name_to_local_kv_cache_metadata:
             region_sessions = self._region_session_indices(layer_name)
@@ -3743,3 +3833,20 @@ class MoRIIOConnectorWorker:
                     ),
                     transfer_id,
                 )
+
+        with self.moriio_wrapper.lock:
+            pending = [
+                status
+                for layer_statuses in self._recving_transfers.get(
+                    request_id, {}
+                ).values()
+                for status in layer_statuses
+            ]
+        if pending:
+            self._read_xfers[request_id] = MoRIIOReadXfer(
+                start=xfer_start,
+                post_duration=time.perf_counter() - xfer_start,
+                num_bytes=self._read_bytes_posted - bytes_before,
+                num_descriptors=self._read_descs_posted - descs_before,
+                pending=pending,
+            )
