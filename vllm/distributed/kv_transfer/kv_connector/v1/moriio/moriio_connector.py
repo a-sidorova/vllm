@@ -1673,6 +1673,8 @@ class MoRIIOConnectorWorker:
         # KV Caches and moriio tracking data.
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.kv_layer_mr_offset: dict[str, int] = {}
+        # KDA layer -> [conv, ssm] byte offsets inside the shared MR.
+        self.kv_region_mr_offsets: dict[str, list[int]] = {}
         self.layer_base_addr_index: dict[str, int] = {}
 
         # Map of engine_id -> kv_caches_base_addr. For TP case, each local
@@ -2240,10 +2242,12 @@ class MoRIIOConnectorWorker:
         slack = ptr % page_size
         end = 0
         for layer_name in kv_caches:
-            _, region_len = next(
-                iter(self._iter_layer_registration_regions(layer_name))
-            )
-            end = max(end, kv_caches[layer_name].data_ptr() - ptr + region_len)
+            # A KDA layer's ssm region starts past its conv region, so every
+            # region must be covered, not just the layer's first one.
+            for cache, region_len in self._iter_layer_registration_regions(
+                layer_name
+            ):
+                end = max(end, cache.data_ptr() - ptr + region_len)
         reg_nbytes = ((slack + end + page_size - 1) // page_size) * page_size
         if reg_nbytes > nbytes:
             raise ValueError(
@@ -2272,6 +2276,29 @@ class MoRIIOConnectorWorker:
             return 0
         mr_base = self.moriio_wrapper.get_unpack_memory_metadata(metas[0]).data
         return remote_moriio_meta.kv_caches_base_addr[idx] - mr_base
+
+    def _remote_region_mr_offsets(
+        self,
+        layer_name: str,
+        remote_moriio_meta: MoRIIOAgentMetadata,
+        remote_engine_id: EngineId,
+    ) -> list[int]:
+        """Byte offsets of a remote KDA layer's [conv, ssm] inside its shared MR."""
+        idx = self.layer_base_addr_index[layer_name]
+        metas = self.layer_name_to_remote_kv_cache_metadata.get(
+            remote_engine_id, {}
+        ).get(layer_name)
+        num_regions = len(self.kv_region_mr_offsets[layer_name])
+        if not metas or idx + num_regions > len(remote_moriio_meta.kv_caches_base_addr):
+            raise MoRIIOError(
+                f"KDA layer {layer_name}: remote shared-MR metadata missing for "
+                f"engine {remote_engine_id}"
+            )
+        mr_base = self.moriio_wrapper.get_unpack_memory_metadata(metas[0]).data
+        return [
+            remote_moriio_meta.kv_caches_base_addr[idx + i] - mr_base
+            for i in range(num_regions)
+        ]
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in moriio."""
@@ -2431,6 +2458,15 @@ class MoRIIOConnectorWorker:
         if shared_backing:
             reg_tensor, self.kv_layer_mr_offset = self._build_shared_kv_mr(kv_caches)
             shared_mr = self.moriio_wrapper.register_local_tensor(reg_tensor)
+            mr_ptr = reg_tensor.data_ptr()
+            self.kv_region_mr_offsets = {
+                layer_name: [
+                    cache.data_ptr() - mr_ptr
+                    for cache, _ in self._iter_layer_registration_regions(layer_name)
+                ]
+                for layer_name in kv_caches
+                if self._is_mamba_layer(layer_name)
+            }
 
         # Say it out loud when the groups disagree. This is expected on a hybrid
         # model and used to be fatal, so a run that silently had one page size
@@ -2459,6 +2495,19 @@ class MoRIIOConnectorWorker:
                 # register_torch_tensor rejects; register a contiguous uint8
                 # alias over each tensor's full byte extent instead (zero-copy:
                 # same storage and data_ptr).
+                if shared_mr is not None:
+                    # Sub-allocation aliases lose their offset when the peer
+                    # opens them through the xGMI IPC path (it maps the start
+                    # of the allocation), so address conv/ssm inside the
+                    # shared MR via kv_region_mr_offsets, like attention.
+                    for _, region_len in self._iter_layer_registration_regions(
+                        layer_name
+                    ):
+                        self.layer_name_to_local_kv_cache_metadata[layer_name].append(
+                            shared_mr
+                        )
+                        self.local_kv_cache_size.append(region_len)
+                    continue
                 conv, ssm = kda_conv_ssm(
                     kv_cache, cast(MambaSpec, self.layer_to_spec[layer_name])
                 )
@@ -3412,6 +3461,8 @@ class MoRIIOConnectorWorker:
         remote_tp_size: int,
         request_id: str,
         deadline: float,
+        remote_moriio_meta: MoRIIOAgentMetadata,
+        remote_engine_id: EngineId,
     ) -> list:
         """Post one KDA layer's conv and ssm reads; return their statuses.
 
@@ -3425,6 +3476,17 @@ class MoRIIOConnectorWorker:
             remote_slots,
             remote_tp_size=remote_tp_size,
         )
+        if self.kv_layer_mr_offset:
+            local_conv, local_ssm = self.kv_region_mr_offsets[layer_name]
+            remote_conv, remote_ssm = self._remote_region_mr_offsets(
+                layer_name, remote_moriio_meta, remote_engine_id
+            )
+            local = [x + local_conv for x in local[:n_conv]] + [
+                x + local_ssm for x in local[n_conv:]
+            ]
+            remote = [x + remote_conv for x in remote[:n_conv]] + [
+                x + remote_ssm for x in remote[n_conv:]
+            ]
         statuses: list = []
         for sess_idx, sl in (
             (region_sessions[0], slice(0, n_conv)),
@@ -3619,6 +3681,8 @@ class MoRIIOConnectorWorker:
                     remote_tp_size,
                     request_id,
                     _sq_deadline,
+                    remote_moriio_meta,
+                    remote_dp_engine_id,
                 )
             else:
                 if self._has_mamba:

@@ -781,6 +781,54 @@ def test_worker_compute_mamba_offsets_caches_and_matches_template():
     assert "kda.0" in worker._mamba_offset_templates
 
 
+def test_post_mamba_reads_shifts_offsets_into_shared_mr():
+    split = _gdn_split_info()
+    conv_shape = (sum(split.local_proj_dims), split.conv_rows)
+    page_bytes = 256
+    pages = torch.zeros((8, 1, 1, page_bytes), dtype=torch.uint8)
+    spec = moriio_connector.MambaSpec(
+        block_size=1,
+        shapes=(conv_shape, (2, 4, 4)),
+        dtypes=(torch.bfloat16, torch.bfloat16),
+        page_size_padded=page_bytes,
+    )
+    posted = []
+    worker = _FakeWorker(
+        kv_caches={"kda.0": pages},
+        layer_to_spec={"kda.0": spec},
+        _conv_decomp=split,
+        _mamba_offset_templates={},
+        tp_rank=0,
+        world_size=1,
+        kv_layer_mr_offset={"kda.0": 4096},
+        kv_region_mr_offsets={"kda.0": [4096, 4096 + 96]},
+        _remote_region_mr_offsets=lambda *_: [8192, 8192 + 96],
+        _post_read_with_backoff=lambda sess, sizes, lo, ro, *_: posted.append(
+            (sess, sizes, lo, ro)
+        ),
+    )
+    lo, ro, sz, n_conv = worker._compute_mamba_transfer_offsets("kda.0", [2], [5])
+
+    worker._post_mamba_reads(
+        "kda.0", ["conv", "ssm"], [0, 1], [2], [5], 1, "req", 0.0, None, "peer"
+    )
+
+    assert posted == [
+        (
+            "conv",
+            sz[:n_conv],
+            [x + 4096 for x in lo[:n_conv]],
+            [x + 8192 for x in ro[:n_conv]],
+        ),
+        (
+            "ssm",
+            sz[n_conv:],
+            [x + 4096 + 96 for x in lo[n_conv:]],
+            [x + 8192 + 96 for x in ro[n_conv:]],
+        ),
+    ]
+
+
 @pytest.mark.parametrize("remote_tp_size", [1, None])
 def test_mamba_tp_ratio_accepts_only_equal_tp(remote_tp_size):
     worker = _FakeWorker(world_size=1)
