@@ -7,9 +7,48 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import functools
+import json
+import os
+from typing import Any
+
 import torch
 
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
+
+_CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
+
+
+@functools.cache
+def get_fused_sigmoid_gating_configs(
+    HV: int, K: int, V: int, T: int
+) -> dict[int, dict[str, Any]] | None:
+    """Tuned launch configs keyed by number of sequences, or None if untuned.
+
+    T is the number of tokens per sequence (num_speculative_tokens + 1 for
+    MTP verify); the best config depends on it. Only consulted on ROCm.
+    Files live in ``configs/`` and follow the fused_moe naming scheme
+    (``...,device_name=<name>.json``).
+    """
+    if not current_platform.is_rocm():
+        return None
+    from vllm.utils.platform_utils import get_device_name_as_file_name
+
+    name = (
+        f"fused_sigmoid_gating,HV={HV},K={K},V={V},T={T},"
+        f"device_name={get_device_name_as_file_name()}.json"
+    )
+    path = os.path.join(_CONFIG_DIR, name)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        configs = {int(n): cfg for n, cfg in json.load(f).items()}
+    logger.info_once("Using fused_sigmoid_gating launch configs from %s", path)
+    return configs
 
 
 @triton.heuristics(
@@ -206,10 +245,19 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
-    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
-    assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
     num_warps = 4
+    extra_launch_kwargs: dict[str, Any] = {}
+    tokens_per_seq = T // N if cu_seqlens is not None and N > 0 else T
+    configs = get_fused_sigmoid_gating_configs(HV, K, V, tokens_per_seq)
+    if configs:
+        # Closest tuned batch size, as for fused_moe configs.
+        cfg = configs[min(configs, key=lambda n: abs(n - N))]
+        BV, num_warps, num_stages = cfg["BV"], cfg["num_warps"], cfg["num_stages"]
+        if cfg.get("waves_per_eu") is not None:
+            extra_launch_kwargs["waves_per_eu"] = cfg["waves_per_eu"]
+    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+    assert NK == 1, "NK > 1 is not supported yet"
 
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(
@@ -274,6 +322,7 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,
+        **extra_launch_kwargs,
     )
     o = o.squeeze(0)
     return o, final_state

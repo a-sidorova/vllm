@@ -103,9 +103,10 @@ def test_fused_sigmoid_gating_delta_rule_update_non_spec(
 
 
 @pytest.mark.parametrize("tp_size", [1])
-@pytest.mark.parametrize("num_reqs", [1, 2, 4])
+# Covers every batch bucket of the tuned ROCm launch configs.
+@pytest.mark.parametrize("num_reqs", [1, 2, 3, 4, 8, 16, 24, 32])
 @pytest.mark.parametrize("num_k_heads", [16])
-@pytest.mark.parametrize("num_v_heads", [32])
+@pytest.mark.parametrize("num_v_heads", [32, 48])
 @pytest.mark.parametrize("head_k_dim", [128])
 @pytest.mark.parametrize("head_v_dim", [128])
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3])
