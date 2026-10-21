@@ -13,6 +13,16 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
+def _use_gfx950_prefill_conv_launch(num_tokens: int) -> bool:
+    """Narrower/fewer-warp launch for causal_conv1d_fn on MI355X: ~1.3x for
+    >=2K-token prefills (bit-exact); below ~1K tokens it is launch-bound."""
+    if not current_platform.is_rocm() or num_tokens < 1024:
+        return False
+    from vllm.platforms.rocm import on_gfx950
+
+    return on_gfx950()
+
+
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -699,6 +709,10 @@ def causal_conv1d_fn(
                     META["token_chunk_offset_ptr"][0:mlist_len].copy_(offsetlist)
             return tot
 
+    block_n, num_warps = 256, 4
+    if _use_gfx950_prefill_conv_launch(x.shape[-1]):
+        block_n, num_warps = 128, 1
+
     def grid(META):
         return (
             num_program(META, args),
@@ -752,7 +766,8 @@ def causal_conv1d_fn(
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
-        BLOCK_N=256,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
         num_stages=2,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -209,6 +210,13 @@ def fused_post_conv_prep(
     BK = triton.next_power_of_2(K)
     BV = triton.next_power_of_2(V)
     BLOCK_T = 16  # tokens per block
+    num_warps = 4
+    if L >= 1024 and current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx950
+
+        if on_gfx950():
+            # MI355X: 1.03-1.08x for >=2K tokens, bit-exact.
+            BLOCK_T, num_warps = 32, 1
 
     # Single kernel: blocks [0,H) do Q/K, blocks [H, H+HV) do V+gating
     grid = (triton.cdiv(L, BLOCK_T), H + HV)
@@ -241,7 +249,7 @@ def fused_post_conv_prep(
         BLOCK_T=BLOCK_T,
         BK=BK,
         BV=BV,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
     )
 
