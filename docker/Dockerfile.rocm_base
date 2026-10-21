@@ -9,8 +9,10 @@ ARG PYTORCH_AUDIO_BRANCH="v2.11.0"
 ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
 ARG FA_BRANCH="0e60e394"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
-ARG AITER_BRANCH="v0.1.24.post1"
-ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_BRANCH="asidorov/qwen3.8_27b_fp8"
+ARG AITER_REPO="https://github.com/a-sidorova/aiter.git"
+# setuptools_scm derives the aiter version from release tags, which forks may lack
+ARG AITER_TAGS_REPO="https://github.com/ROCm/aiter.git"
 ARG MORI_BRANCH="v1.2.3.post1"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
@@ -257,11 +259,15 @@ RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 FROM base AS build_aiter
 ARG AITER_BRANCH
 ARG AITER_REPO
+ARG AITER_TAGS_REPO
 ARG USE_SCCACHE
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO}
 RUN cd aiter \
+    && { git describe --tags >/dev/null 2>&1 \
+         || git fetch --no-recurse-submodules --tags ${AITER_TAGS_REPO}; } \
+    && git describe --tags \
     && git submodule update --init --recursive \
     && pip install -r requirements.txt
 RUN pip install pyyaml && cd aiter \
