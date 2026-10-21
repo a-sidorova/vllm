@@ -172,6 +172,7 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
     ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
+    AiterFp8BlockScaledBPreshuffleMMKernel,
     AiterFp8BlockScaledMMKernel,
     AiterHipbMMPerTokenFp8ScaledMMLinearKernel,
     AiterInt8ScaledMMLinearKernel,
@@ -342,6 +343,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     },
     "aiter": {
         AiterInt8ScaledMMLinearKernel,
+        AiterFp8BlockScaledBPreshuffleMMKernel,
         AiterFp8BlockScaledMMKernel,
         AiterPerTokenFp8ScaledMMLinearKernel,
         AiterPreshuffledPerTokenFp8ScaledMMLinearKernel,
@@ -489,6 +491,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
         BlockWiseTorchFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        AiterFp8BlockScaledBPreshuffleMMKernel,
         AiterFp8BlockScaledMMKernel,
         TritonFp8BlockScaledMMKernel,
     ],

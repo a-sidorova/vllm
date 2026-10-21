@@ -45,16 +45,30 @@ logger = init_logger(__name__)
 FP8_DTYPE = current_platform.fp8_dtype()
 
 
+def _transposed_group_quant_enabled() -> bool:
+    """Whether linears may quantize with column-major group scales, so the
+    group-quant fusions also need their transpose_scale variants."""
+    return rocm_aiter_ops.is_linear_fp8_blockscale_bpreshuffle_enabled()
+
+
 class AiterRMSNormQuantPattern:
     def __init__(
-        self, epsilon: float, key: FusedRMSQuantKey, match_aiter_quant: bool = True
+        self,
+        epsilon: float,
+        key: FusedRMSQuantKey,
+        match_aiter_quant: bool = True,
+        transpose_scale: bool = False,
     ):
         self.epsilon = epsilon
         self.quant_dtype = key.quant.dtype
         self.device = torch.device("cuda")
+        # Group quant with column-major scales, the input of the B-preshuffled
+        # blockscale GEMM (AiterFp8BlockScaledBPreshuffleMMKernel).
+        self.transpose_scale = transpose_scale
 
         self.quant_matcher = MatcherQuantFP8(
             key.quant,
+            has_col_major_scales=transpose_scale,
             match_rocm_aiter=match_aiter_quant,
         )
 
@@ -194,6 +208,7 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         group_shape: GroupShape,
         match_aiter_quant: bool = True,
         symmetric: bool = True,
+        transpose_scale: bool = False,
     ) -> None:
         scale = ScaleDesc(torch.float32, False, group_shape)
         key = FusedRMSQuantKey(
@@ -201,7 +216,7 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             quant=QuantKey(dtype=quant_dtype, scale=scale, symmetric=symmetric),
         )
 
-        super().__init__(epsilon, key, match_aiter_quant)
+        super().__init__(epsilon, key, match_aiter_quant, transpose_scale)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -221,6 +236,7 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
                 weight=weight,
                 variance_epsilon=self.epsilon,
                 group_size=128,
+                transpose_scale=self.transpose_scale,
             )
 
             return at[0], at[1]
@@ -249,6 +265,7 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         group_shape: GroupShape,
         match_aiter_quant: bool = True,
         symmetric: bool = True,
+        transpose_scale: bool = False,
     ) -> None:
         scale = ScaleDesc(torch.float32, False, group_shape)
         key = FusedRMSQuantKey(
@@ -256,7 +273,7 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             quant=QuantKey(dtype=quant_dtype, scale=scale, symmetric=symmetric),
         )
 
-        super().__init__(epsilon, key, match_aiter_quant)
+        super().__init__(epsilon, key, match_aiter_quant, transpose_scale)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -282,6 +299,7 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
                 weight=weight,
                 variance_epsilon=self.epsilon,
                 group_size=128,
+                transpose_scale=self.transpose_scale,
             )
 
             # result, scale, residual
@@ -471,13 +489,14 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         head_dim: int,
         match_aiter_quant: bool = True,
         symmetric: bool = True,
+        transpose_scale: bool = False,
     ) -> None:
         scale = ScaleDesc(torch.float32, False, group_shape)
         key = FusedRMSQuantKey(
             fused_add=False,
             quant=QuantKey(dtype=quant_dtype, scale=scale, symmetric=symmetric),
         )
-        super().__init__(epsilon, key, match_aiter_quant)
+        super().__init__(epsilon, key, match_aiter_quant, transpose_scale)
         self.rmsnorm_gated_matcher = MatcherRMSNormGated(epsilon)
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -532,6 +551,12 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             scales_out = fused[1]
             fp8_reshaped = fp8_out.reshape(-1, hidden_dim)
             scales_reshaped = scales_out.reshape(-1, num_heads)
+            if self.transpose_scale:
+                # The kernel writes one scale per (token, head) row, so the
+                # column-major (heads, tokens) bytes take a transpose.
+                scales_reshaped = (
+                    scales_reshaped.t().contiguous().reshape(-1, num_heads)
+                )
             return fp8_reshaped, scales_reshaped
 
         n_tokens = 2
@@ -600,6 +625,9 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
 
         # RDNA4 uses native quant ops and supports only Triton replacements.
         match_aiter_quant_op = not rocm_aiter_ops.is_rdna_aiter_enabled()
+        transpose_scale_options = [False]
+        if match_aiter_quant_op and _transposed_group_quant_enabled():
+            transpose_scale_options.append(True)
 
         # Make sure fused add patterns are before simple rms norm,
         # as the latter is a subset of the former in torch ops.
@@ -620,15 +648,24 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                 epsilon, FP8_DTYPE, GroupShape(1, 128), match_aiter_quant_op
             ).register(self.patterns)
 
-            #  Fuse aiter rms_norm + aiter dynamic group fp8 quant
-            AiterRMSFp8GroupQuantPattern(
-                epsilon, FP8_DTYPE, GroupShape(1, 128), match_aiter_quant_op
-            ).register(self.patterns)
+            for transpose_scale in transpose_scale_options:
+                #  Fuse aiter rms_norm + aiter dynamic group fp8 quant
+                AiterRMSFp8GroupQuantPattern(
+                    epsilon,
+                    FP8_DTYPE,
+                    GroupShape(1, 128),
+                    match_aiter_quant_op,
+                    transpose_scale=transpose_scale,
+                ).register(self.patterns)
 
-            # Fuse aiter fused_add_rms_norm + aiter dynamic group fp8 quant
-            AiterFusedAddRMSFp8GroupQuantPattern(
-                epsilon, FP8_DTYPE, GroupShape(1, 128), match_aiter_quant_op
-            ).register(self.patterns)
+                # Fuse aiter fused_add_rms_norm + aiter dynamic group fp8 quant
+                AiterFusedAddRMSFp8GroupQuantPattern(
+                    epsilon,
+                    FP8_DTYPE,
+                    GroupShape(1, 128),
+                    match_aiter_quant_op,
+                    transpose_scale=transpose_scale,
+                ).register(self.patterns)
 
             # When quant_fp8 custom ops are disabled, both AITER and native
             # quant matchers trace through QuantFP8's native implementation.
@@ -666,14 +703,16 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                 for num_heads, head_dim in gated_norm_shapes:
                     if head_dim != 128:
                         continue
-                    AiterRMSNormGatedFp8GroupQuantPattern(
-                        epsilon,
-                        FP8_DTYPE,
-                        GroupShape(1, 128),
-                        num_heads=num_heads,
-                        head_dim=head_dim,
-                        match_aiter_quant=match_aiter_quant_op,
-                    ).register(self.patterns)
+                    for transpose_scale in transpose_scale_options:
+                        AiterRMSNormGatedFp8GroupQuantPattern(
+                            epsilon,
+                            FP8_DTYPE,
+                            GroupShape(1, 128),
+                            num_heads=num_heads,
+                            head_dim=head_dim,
+                            match_aiter_quant=match_aiter_quant_op,
+                            transpose_scale=transpose_scale,
+                        ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 
@@ -704,10 +743,15 @@ class AiterSiluMulFp8GroupQuantPattern(VllmPatternReplacement):
 
     FUSED_SILU_MUL_QUANT_OP = rocm_aiter_ops.get_act_mul_fused_fp8_group_quant_op()
 
-    def __init__(self, match_aiter_quant_op: bool = True) -> None:
+    def __init__(
+        self, match_aiter_quant_op: bool = True, transpose_scale: bool = False
+    ) -> None:
         self.silu_and_mul_matcher = MatcherSiluAndMul()
+        self.transpose_scale = transpose_scale
         self.quant_matcher = MatcherQuantFP8(
-            quant_key=kFp8Dynamic128Sym, match_rocm_aiter=match_aiter_quant_op
+            quant_key=kFp8Dynamic128Sym,
+            has_col_major_scales=transpose_scale,
+            match_rocm_aiter=match_aiter_quant_op,
         )
 
     def get_inputs(self) -> list[torch.Tensor]:
@@ -731,7 +775,9 @@ class AiterSiluMulFp8GroupQuantPattern(VllmPatternReplacement):
         def _replacement(
             input: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            at = self.FUSED_SILU_MUL_QUANT_OP(x=input, group_size=128)
+            at = self.FUSED_SILU_MUL_QUANT_OP(
+                x=input, group_size=128, transpose_scale=self.transpose_scale
+            )
             return at[0], at[1]
 
         return _replacement
@@ -754,6 +800,12 @@ class RocmAiterSiluMulFp8GroupQuantFusionPass(VllmFusionPatternMatcherPass):
         self.register(
             AiterSiluMulFp8GroupQuantPattern(match_aiter_quant_op=match_aiter_quant_op)
         )
+        if match_aiter_quant_op and _transposed_group_quant_enabled():
+            self.register(
+                AiterSiluMulFp8GroupQuantPattern(
+                    match_aiter_quant_op=True, transpose_scale=True
+                )
+            )
 
         self.dump_patterns(config, self.pm_pass)
 

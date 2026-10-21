@@ -438,6 +438,8 @@ class MatcherQuantFP8(MatcherCustomOp):
                 quant_dtype=self.quant_key.dtype,
                 scale=scale,
             )
+        elif self.has_col_major_scales:
+            return self.QUANT_OP(input, quant_key_group_shape.col, True)  # type: ignore[no-any-return]
         else:
             return self.QUANT_OP(input, quant_key_group_shape.col)  # type: ignore[no-any-return]
 

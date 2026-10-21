@@ -13,6 +13,7 @@ from torch._ops import OpOverload
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_aiter_sparse_attn_indexer,
@@ -39,6 +40,8 @@ _FP8_E4M3_DTYPES = {
 }
 KB = 1024
 MB = 1024 * KB
+# Largest output (bytes) the aiter blockscale-bpreshuffle kernels accept.
+_BPRESHUFFLE_MAX_OUT_BYTES = 2**31 - 1
 
 
 def _is_fp8_e4m3_tensor(t: torch.Tensor | None) -> bool:
@@ -975,7 +978,34 @@ def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl(
     from aiter import gemm_a8w8_blockscale_bpreshuffle
 
     # B preshuffled (shuffle_weight (16,16)); As column-major group scale.
-    return gemm_a8w8_blockscale_bpreshuffle(A, B, As, Bs, dtype=output_dtype)
+    m, n = A.shape[0], B.shape[0]
+    num_groups = As.shape[1]
+    # Column-major scales come either as aiter's contiguous (M, G) tensor with
+    # (G, M) bytes or as a (G, M) tensor transposed to (M, G) (QuantFP8 with
+    # column_major_scales); the kernels read raw bytes, so take the former.
+    if not As.is_contiguous() and As.t().is_contiguous():
+        As = As.t().view(m, num_groups)
+    max_rows = _BPRESHUFFLE_MAX_OUT_BYTES // (n * output_dtype.itemsize)
+    if m <= max_rows:
+        return gemm_a8w8_blockscale_bpreshuffle(A, B, As, Bs, dtype=output_dtype)
+
+    # The aiter kernels reject outputs of 2**31 bytes or more, so run M in even
+    # chunks; each chunk needs its own contiguous column-major scale slice.
+    num_chunks = cdiv(m, max_rows)
+    chunk = min(round_up(cdiv(m, num_chunks), 128), max_rows // 128 * 128)
+    As_cm = As.view(num_groups, m)
+    out = torch.empty(m, n, dtype=output_dtype, device=A.device)
+    for start in range(0, m, chunk):
+        end = min(start + chunk, m)
+        gemm_a8w8_blockscale_bpreshuffle(
+            A[start:end],
+            B,
+            As_cm[:, start:end].contiguous().view(end - start, num_groups),
+            Bs,
+            dtype=output_dtype,
+            out=out[start:end],
+        )
+    return out
 
 
 def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake(
@@ -1315,6 +1345,7 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -1328,6 +1359,7 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
         group_size=group_size,
         dtype_quant=FP8_DTYPE,
         res1=residual,
+        transpose_scale=transpose_scale,
     )
     return (
         x_quant,
@@ -1342,6 +1374,7 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake(
     weight: torch.Tensor,
     variance_epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, N = x.shape
     scale_shape = (M, (N + group_size - 1) // group_size)
@@ -1357,6 +1390,7 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -1370,6 +1404,7 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_impl(
         group_size=group_size,
         dtype_quant=FP8_DTYPE,
         res1=None,
+        transpose_scale=transpose_scale,
     )
     return (x_quant, x_quant_scales)
 
@@ -1379,6 +1414,7 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_fake(
     weight: torch.Tensor,
     variance_epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
     scale_shape = (M, (N + group_size - 1) // group_size)
@@ -1467,20 +1503,56 @@ def _rocm_aiter_group_fp8_quant_fake(
 def _rocm_aiter_act_mul_and_fp8_group_quant_impl(
     x: torch.Tensor,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
+    if not transpose_scale:
+        from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
 
-    return act_mul_and_fp8_group_quant(
-        x,
-        activation="silu",
-        group_size=group_size,
-        dtype_quant=FP8_DTYPE,
+        return act_mul_and_fp8_group_quant(
+            x,
+            activation="silu",
+            group_size=group_size,
+            dtype_quant=FP8_DTYPE,
+        )
+
+    # aiter's wrapper has no transpose_scale, but its kernel takes the scale
+    # strides, so it writes the column-major scale bytes the B-preshuffled
+    # blockscale GEMM reads (same layout as per_group_quant_hip(transpose_scale)).
+    import triton
+    from aiter.ops.triton._triton_kernels.fusions.activation import (
+        _act_mul_and_dynamic_fp8_group_quant_kernel,
     )
+
+    M, N = x.shape
+    assert N % 2 == 0
+    N_half = N // 2
+    num_groups = triton.cdiv(N_half, group_size)
+    x_fp8 = torch.empty((M, N_half), dtype=FP8_DTYPE, device=x.device)
+    scale_t = torch.empty((num_groups, M), dtype=torch.float32, device=x.device)
+    fp8_max = torch.finfo(FP8_DTYPE).max
+    _act_mul_and_dynamic_fp8_group_quant_kernel[(M, num_groups)](
+        x,
+        x_fp8,
+        scale_t,
+        *x.stride(),
+        *x_fp8.stride(),
+        scale_t.stride(1),
+        scale_t.stride(0),
+        N=N_half,
+        ACTIVATION="silu",
+        scaleN=triton.cdiv(N, group_size),
+        BLOCK_SIZE_N=group_size,
+        QUANT_BLOCK_SIZE=group_size,
+        DTYPE_MAX=fp8_max,
+        DTYPE_MIN=-fp8_max,
+    )
+    return x_fp8, scale_t.view(M, num_groups)
 
 
 def _rocm_aiter_act_mul_and_fp8_group_quant_fake(
     x: torch.Tensor,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
     assert N % 2 == 0
@@ -2024,6 +2096,9 @@ class rocm_aiter_ops:
     _FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
     _FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
     _LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
+    _FP8_BLOCKSCALE_BPRESHUFFLE_ENABLED = (
+        envs.VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_BPRESHUFFLE
+    )
     # TODO: Consolidate under _LINEAR_ENABLED
     _FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
     # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
@@ -2056,6 +2131,9 @@ class rocm_aiter_ops:
         cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
         cls._FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
         cls._LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
+        cls._FP8_BLOCKSCALE_BPRESHUFFLE_ENABLED = (
+            envs.VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_BPRESHUFFLE
+        )
         cls._FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._TRITON_SPARSE_MLA = envs.VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA
@@ -2162,6 +2240,11 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_linear_fp8_enabled(cls) -> bool:
         return cls.is_linear_enabled()
+
+    @classmethod
+    @if_aiter_supported
+    def is_linear_fp8_blockscale_bpreshuffle_enabled(cls) -> bool:
+        return cls.is_linear_enabled() and cls._FP8_BLOCKSCALE_BPRESHUFFLE_ENABLED
 
     @classmethod
     @if_aiter_supported
@@ -3941,6 +4024,31 @@ class rocm_aiter_ops:
             return _triton_gemm_config_is_tuned("GEMM-A8W8_BLOCKSCALE", n, k)
         except (AssertionError, ImportError):
             return False
+
+    @staticmethod
+    @functools.cache
+    def is_gemm_a8w8_blockscale_bpreshuffle_tuned(n: int, k: int) -> bool:
+        """Whether the merged blockscale-bpreshuffle table has rows for (N, K)
+        on this gfx / CU count."""
+        if not current_platform.is_rocm():
+            return False
+        try:
+            import pandas as pd
+            from aiter.jit.core import AITER_CONFIGS
+            from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+            path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+            df = pd.read_csv(path, usecols=["gfx", "cu_num", "N", "K"])
+        except (AttributeError, ImportError, OSError, ValueError):
+            return False
+        return bool(
+            (
+                (df["gfx"] == get_gfx())
+                & (df["cu_num"] == get_cu_num())
+                & (df["N"] == n)
+                & (df["K"] == k)
+            ).any()
+        )
 
     @staticmethod
     @functools.cache

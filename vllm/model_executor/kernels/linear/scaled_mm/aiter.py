@@ -9,6 +9,7 @@ from vllm._aiter_ops import (
     rocm_aiter_ops,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _upcast_e8m0_to_fp32,
 )
@@ -471,4 +472,75 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
         return gemm_a8w8_blockscale_op(
             A, B, As, Bs, list(self.weight_group_shape), output_dtype=out_dtype
+        )
+
+
+class AiterFp8BlockScaledBPreshuffleMMKernel(AiterFp8BlockScaledMMKernel):
+    """aiter CK / CKTile / asm GEMM on (16, 16)-preshuffled weights, dispatched
+    by AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE. Activations are quantized
+    with column-major scales, the layout these kernels read."""
+
+    def __init__(self, config: FP8ScaledMMLinearLayerConfig):
+        super().__init__(config)
+        self.use_triton = False
+        self.quant_fp8 = QuantFP8(
+            static=False,
+            group_shape=config.activation_quant_key.scale.group_shape,
+            num_token_padding=self.get_output_padding(),
+            column_major_scales=True,
+            use_ue8m0=False,
+        )
+
+    @classmethod
+    def is_supported(cls, compute_capability=None):
+        if not rocm_aiter_ops.is_linear_fp8_blockscale_bpreshuffle_enabled():
+            return (
+                False,
+                "requires VLLM_ROCM_USE_AITER=1, VLLM_ROCM_USE_AITER_LINEAR=1 and "
+                "VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_BPRESHUFFLE=1.",
+            )
+        if current_platform.is_fp8_fnuz():
+            return False, "requires OCP fp8 (gfx950)."
+        return True, None
+
+    @classmethod
+    def can_implement(cls, config: FP8ScaledMMLinearLayerConfig):
+        can_implement_base, reason = super().can_implement(config)
+        if not can_implement_base:
+            return can_implement_base, reason
+        if config.weight_quant_key.scale.group_shape != GroupShape(128, 128):
+            return False, "requires 128x128 weight scale blocks."
+        if config.out_dtype not in (torch.bfloat16, torch.float16):
+            return False, "requires bfloat16 or float16 output dtype."
+        n, k = config.weight_shape
+        if n % 16 or k % 128:
+            return False, f"requires N % 16 == 0 and K % 128 == 0, got {n=} {k=}."
+        if not rocm_aiter_ops.is_gemm_a8w8_blockscale_bpreshuffle_tuned(n, k):
+            return (
+                False,
+                f"(N={n}, K={k}) has no AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE "
+                "row.",
+            )
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        params = FP8BlockParams.from_layer(layer)
+        replace_parameter(
+            layer,
+            params.WEIGHT,
+            rocm_aiter_ops.shuffle_weight(
+                params.weight.data.contiguous(), layout=(16, 16)
+            ),
+        )
+
+    def apply_block_scaled_mm(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+    ) -> torch.Tensor:
+        return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+            A, B, As, Bs, output_dtype=self.config.out_dtype
         )

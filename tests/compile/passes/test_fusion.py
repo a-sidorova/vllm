@@ -19,7 +19,7 @@ from vllm.compilation.passes.fusion.rms_quant_fusion import (
     FusedRMSQuantKey,
     RMSNormQuantFusionPass,
 )
-from vllm.compilation.passes.fx_utils import find_auto_fn_maybe
+from vllm.compilation.passes.fx_utils import find_auto_fn_maybe, find_op_nodes
 from vllm.compilation.passes.utility.fix_functionalization import (
     FixFunctionalizationPass,
 )
@@ -33,6 +33,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.model_executor.kernels.linear import (
+    AiterFp8BlockScaledBPreshuffleMMKernel,
     AiterFp8BlockScaledMMKernel,
     ChannelWiseTorchFP8ScaledMMLinearKernel,
     CutlassFp8BlockScaledMMKernel,
@@ -109,7 +110,22 @@ AITER_KERNEL_GROUPSHAPE_COMBINATIONS = [
     (ChannelWiseTorchFP8ScaledMMLinearKernel, GroupShape.PER_TOKEN, False),
     # Blockwise
     (AiterFp8BlockScaledMMKernel, GroupShape(1, 128), True),
+    # Blockwise, B-preshuffled weights with transposed activation scales
+    (AiterFp8BlockScaledBPreshuffleMMKernel, GroupShape(1, 128), True),
 ]
+
+
+def _enable_aiter_bpreshuffle(m: pytest.MonkeyPatch) -> None:
+    """Select AiterFp8BlockScaledBPreshuffleMMKernel for the toy square shapes,
+    which have no rows in the tuned bpreshuffle table."""
+    if current_platform.is_fp8_fnuz():
+        pytest.skip("Blockscale bpreshuffle needs OCP FP8 (gfx950)")
+    m.setenv("VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_BPRESHUFFLE", "1")
+    m.setattr(
+        rocm_aiter_ops,
+        "is_gemm_a8w8_blockscale_bpreshuffle_tuned",
+        staticmethod(lambda n, k: True),
+    )
 
 
 class TestModel(torch.nn.Module):
@@ -518,6 +534,8 @@ def test_aiter_fusion_rmsnorm_quant(
         )
 
         m.setenv("VLLM_ROCM_USE_AITER", "1")
+        if force_kernel is AiterFp8BlockScaledBPreshuffleMMKernel:
+            _enable_aiter_bpreshuffle(m)
 
         rocm_aiter_ops.refresh_env_variables()
 
@@ -536,10 +554,35 @@ def test_aiter_fusion_rmsnorm_quant(
             use_aiter_fusion=True,  # Always use aiter fusion ops in aiter test
             use_aiter_quant=use_aiter_quant_op,  # Toggle aiter quantization
         )
+        transpose_scale = force_kernel is AiterFp8BlockScaledBPreshuffleMMKernel
+        if transpose_scale:
+            assert all(
+                type(layer.kernel) is force_kernel for layer in model.fp8_linear_layers
+            )
 
-        _run_fusion_test(
+        backend, _ = _run_fusion_test(
             model, fusion_pass, vllm_config, dtype, hidden_size, num_tokens
         )
+        if group_shape.is_per_group():
+            _check_fused_transpose_scale(
+                backend, model.ops_in_model_after(), transpose_scale
+            )
+    rocm_aiter_ops.refresh_env_variables()
+
+
+def _check_fused_transpose_scale(backend, fused_ops, transpose_scale: bool):
+    nodes = [n for op in fused_ops for n in find_op_nodes(op, backend.graph_post_pass)]
+    assert nodes
+    for n in nodes:
+        schema_args = n.target._schema.arguments
+        idx = next(i for i, a in enumerate(schema_args) if a.name == "transpose_scale")
+        if "transpose_scale" in n.kwargs:
+            value = n.kwargs["transpose_scale"]
+        elif idx < len(n.args):
+            value = n.args[idx]
+        else:
+            value = schema_args[idx].default_value
+        assert bool(value) == transpose_scale, n.format_node()
 
 
 class TestGatedModel(torch.nn.Module):
@@ -643,6 +686,10 @@ class _MockGDNLayer:
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 @pytest.mark.parametrize("flatten_heads", [True, False])
 @pytest.mark.parametrize("quant_fp8_op", ["-quant_fp8", "+quant_fp8"])
+@pytest.mark.parametrize(
+    "force_kernel",
+    [AiterFp8BlockScaledMMKernel, AiterFp8BlockScaledBPreshuffleMMKernel],
+)
 @pytest.mark.skipif(
     (not current_platform.is_rocm() or not IS_AITER_FOUND),
     reason="Only test on ROCm with aiter package installed",
@@ -655,6 +702,7 @@ def test_aiter_fusion_rmsnorm_gated_quant(
     eps: float,
     flatten_heads: bool,
     quant_fp8_op: str,
+    force_kernel: type[_KernelT],
     monkeypatch: pytest.MonkeyPatch,
 ):
     group_shape = GroupShape(1, 128)
@@ -673,6 +721,8 @@ def test_aiter_fusion_rmsnorm_gated_quant(
         )
 
         m.setenv("VLLM_ROCM_USE_AITER", "1")
+        if force_kernel is AiterFp8BlockScaledBPreshuffleMMKernel:
+            _enable_aiter_bpreshuffle(m)
         rocm_aiter_ops.refresh_env_variables()
 
         # Register a mock GDN layer so the pass discovers num_heads/head_dim
@@ -691,12 +741,13 @@ def test_aiter_fusion_rmsnorm_gated_quant(
             num_heads=num_heads,
             head_dim=head_dim,
             eps=eps,
-            force_kernel=AiterFp8BlockScaledMMKernel,
+            force_kernel=force_kernel,
             group_shape=group_shape,
             dtype=dtype,
             use_aiter_quant=True,
             flatten_heads=flatten_heads,
         )
+        assert type(model.fp8_linear.kernel) is force_kernel
 
         noop_pass = NoOpEliminationPass(vllm_config)
         cleanup_pass = PostCleanupPass(vllm_config)
@@ -724,6 +775,7 @@ def test_aiter_fusion_rmsnorm_gated_quant(
 
         assert fusion_pass.matched_count == 1
         backend.check_after_ops(model.ops_in_model_after())
+    rocm_aiter_ops.refresh_env_variables()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

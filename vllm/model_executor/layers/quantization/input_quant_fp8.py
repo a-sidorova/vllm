@@ -146,10 +146,21 @@ class QuantFP8(CustomOp):
         )
         use_aiter_per_token_quant = use_aiter_quant and self.group_shape.is_per_token()
 
-        use_aiter_per_group_quant = use_aiter_quant and self.group_shape.is_per_group()
+        use_aiter_per_group_quant = (
+            use_aiter_quant
+            and self.group_shape.is_per_group()
+            and (not self.column_major_scales or x.dim() == 2)
+        )
 
         if use_aiter_per_group_quant:
-            return rocm_aiter_ops.group_fp8_quant(x, self.group_size)
+            x_q, x_s = rocm_aiter_ops.group_fp8_quant(
+                x, self.group_size, transpose_scale=self.column_major_scales
+            )
+            if self.column_major_scales:
+                # aiter returns an (M, groups) tensor holding (groups, M) bytes;
+                # expose it as the column-major view the other paths return.
+                x_s = x_s.view(x_s.shape[1], x_s.shape[0]).t()
+            return x_q, x_s
         if use_aiter_per_tensor_quant:
             return rocm_aiter_ops.per_tensor_quant(x, _FP8_DTYPE, scale)
         if use_aiter_per_token_quant:

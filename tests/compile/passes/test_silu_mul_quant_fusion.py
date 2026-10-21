@@ -18,6 +18,7 @@ from vllm.compilation.passes.fusion.act_quant_fusion import (
     ActivationQuantFusionPass,
 )
 from vllm.compilation.passes.fusion.rms_quant_fusion import QUANT_OPS
+from vllm.compilation.passes.fx_utils import find_op_nodes
 from vllm.compilation.passes.utility.noop_elimination import NoOpEliminationPass
 from vllm.compilation.passes.utility.post_cleanup import PostCleanupPass
 from vllm.config import (
@@ -28,6 +29,7 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.model_executor.kernels.linear import (
+    AiterFp8BlockScaledBPreshuffleMMKernel,
     CutlassFP8ScaledMMLinearKernel,
     FlashInferFP8ScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -144,11 +146,19 @@ class TestSiluMulNvfp4QuantModel(torch.nn.Module):
 class TestSiluMulGroupFp8QuantModel(torch.nn.Module):
     act_quant_key = kFp8Dynamic128Sym
 
-    def __init__(self, hidden_size: int, dtype: torch.dtype, **kwargs):
+    def __init__(
+        self,
+        hidden_size: int,
+        dtype: torch.dtype,
+        force_kernel: type[FP8ScaledMMLinearKernel] | None = None,
+        **kwargs,
+    ):
         super().__init__()
         self.silu_and_mul = SiluAndMul()
+        # The bpreshuffle kernel (transposed activation scales) needs 128x128.
+        weight_block = 128 if force_kernel is not None else hidden_size
         self.weight_quant_key = create_fp8_quant_key(
-            static=True, group_shape=GroupShape(hidden_size, hidden_size)
+            static=True, group_shape=GroupShape(weight_block, weight_block)
         )
 
         self.w8a8_block_fp8_linear = TestFP8Layer(
@@ -156,7 +166,10 @@ class TestSiluMulGroupFp8QuantModel(torch.nn.Module):
             weight_quant_key=self.weight_quant_key,
             activation_quant_key=self.act_quant_key,
             input_dtype=dtype,
+            force_kernel=force_kernel,
         )
+        if force_kernel is not None:
+            assert type(self.w8a8_block_fp8_linear.kernel) is force_kernel
 
         self.enable_silu_mul_custom_op = self.silu_and_mul.enabled()
 
@@ -252,6 +265,16 @@ TEST_KERNELS = ROCM_KERNELS if current_platform.is_rocm() else CUDA_KERNELS
                 not current_platform.is_rocm(), reason="ROCm only"
             ),
         ),
+        # Transposed-scale variant feeding the B-preshuffled blockscale GEMM.
+        pytest.param(
+            TestSiluMulGroupFp8QuantModel,
+            True,
+            AiterFp8BlockScaledBPreshuffleMMKernel,
+            marks=pytest.mark.skipif(
+                not current_platform.is_rocm() or current_platform.is_fp8_fnuz(),
+                reason="ROCm OCP FP8 (gfx950) only",
+            ),
+        ),
         # Block quant fusion for per-group FP8 (CUDA only).
         *[
             pytest.param(
@@ -324,6 +347,14 @@ def test_fusion_silu_and_mul_quant(
             )
 
             m.setenv("VLLM_ROCM_USE_AITER", "1")
+            if force_kernel is AiterFp8BlockScaledBPreshuffleMMKernel:
+                # The toy shapes have no rows in the tuned bpreshuffle table.
+                m.setenv("VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_BPRESHUFFLE", "1")
+                m.setattr(
+                    rocm_aiter_ops,
+                    "is_gemm_a8w8_blockscale_bpreshuffle_tuned",
+                    staticmethod(lambda n, k: True),
+                )
             rocm_aiter_ops.refresh_env_variables()
             fusion_passes += [RocmAiterSiluMulFp8GroupQuantFusionPass(config)]
 
@@ -371,3 +402,15 @@ def test_fusion_silu_and_mul_quant(
 
         # In post-nodes, fused kernels should be present and quant op should not
         backend.check_after_ops(model.ops_in_model_after())
+
+        if isinstance(model, TestSiluMulGroupFp8QuantModel):
+            (fused,) = find_op_nodes(
+                torch.ops.vllm.rocm_aiter_act_mul_and_fp8_group_quant.default,
+                backend.graph_post_pass,
+            )
+            expect_transposed = force_kernel is AiterFp8BlockScaledBPreshuffleMMKernel
+            transposed = fused.kwargs.get(
+                "transpose_scale", fused.args[2] if len(fused.args) > 2 else False
+            )
+            assert bool(transposed) == expect_transposed, fused.format_node()
+    rocm_aiter_ops.refresh_env_variables()
