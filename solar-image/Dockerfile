@@ -1,7 +1,7 @@
 # Solar-Open2 v0.31.0 image: the Solar-Open2 port onto vLLM v0.31.0 (fused MoE
 # router for MXFP4 and FP8 per-token experts, DFlash, fused KDA under
-# speculative decoding) plus the 250B TP4 bf16 GEMM tuning and the 35B FP8 TP1
-# a8w8 GEMM tuning.
+# speculative decoding) plus the 250B TP4 bf16 GEMM tuning, the 35B FP8 TP1
+# a8w8 GEMM tuning and the 250B TP4+EP MXFP4 fused-MoE tuning.
 #
 # Base: stock vllm/vllm-openai-rocm:v0.31.0. AITER and flydsl are NOT replaced -
 # the router is injected as a nine-file overlay onto the AITER the image already
@@ -150,13 +150,20 @@ RUN chmod +x /usr/local/bin/verify-fused-router
 #     var is preset to it and overriding it means rebuilding that module (see
 #     README). Only FP8 checkpoints run a8w8 GEMMs; the MXFP4 ones run none.
 #
-#     The MoE table is AITER's stock one: AITER_CONFIG_FMOE is left unset.
+#     fmoe: the 250B MXFP4 table at TP4 + EP (80 local experts, topk 8; 81 /
+#     topk 10 with the fused shared expert), all FlyDSL. Read at runtime. It
+#     is linked into aiter/configs/model_configs/ and AITER_CONFIG_FMOE is left
+#     unset, so AITER merges it with its stock tables at startup and the 35B
+#     MoE shapes keep their stock configs. Setting AITER_CONFIG_FMOE replaces
+#     that whole set, this table included.
 # ---------------------------------------------------------------------------
 COPY tuning/bf16_tuned_gemms_250b_tp4.csv \
-     tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv /tuning/
+     tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv \
+     tuning/a4w4_tuned_fmoe_250b_tp4.csv /tuning/
 COPY tuning_check.py /tmp/tuning_check.py
 RUN set -eu; \
     python3 /tmp/tuning_check.py ${SITE_PACKAGES}; \
+    ln -s /tuning/a4w4_tuned_fmoe_250b_tp4.csv ${SITE_PACKAGES}/aiter/configs/model_configs/; \
     rm -f /tmp/tuning_check.py
 ENV AITER_CONFIG_GEMM_BF16=/tuning/bf16_tuned_gemms_250b_tp4.csv
 ENV AITER_CONFIG_GEMM_A8W8=/tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv
@@ -171,7 +178,7 @@ RUN printf '%s\n' \
     'PYTORCH_ROCM_ARCH: gfx950' \
     'AITER_CONFIG_GEMM_BF16: /tuning/bf16_tuned_gemms_250b_tp4.csv (250B TP4)' \
     'AITER_CONFIG_GEMM_A8W8: /tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv (compiled into module_gemm_a8w8.so)' \
-    'AITER_CONFIG_FMOE: AITER stock' \
+    'AITER_CONFIG_FMOE: unset; AITER stock + /tuning/a4w4_tuned_fmoe_250b_tp4.csv (250B TP4+EP, via model_configs/)' \
     'VLLM_USE_V2_MODEL_RUNNER: unset (vLLM picks Model Runner V2)' \
     >> /app/versions.txt
 

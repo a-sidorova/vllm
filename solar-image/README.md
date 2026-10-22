@@ -5,7 +5,8 @@ vLLM ROCm image for Solar-Open2 on MI355X:
 > Baseline + eliminated element-wise small kernels + fused MoE-router kernel
 > (`VLLM_ROCM_USE_AITER_FUSED_ROUTER=1`, ROCm/aiter#5150) for **MXFP4 and FP8
 > per-token** experts + DFlash and fused KDA under speculative decoding +
-> tuned GEMMs for the 250B at TP4 (bf16) and the 35B FP8 at TP1 (a8w8).
+> tuned GEMMs for the 250B at TP4 (bf16) and the 35B FP8 at TP1 (a8w8) +
+> tuned MXFP4 fused MoE for the 250B at TP4 + EP.
 
 Built from the current heads of the two branches:
 
@@ -32,7 +33,7 @@ Self-contained: engine, router kernel and tuning are all in the image.
 | Engine remote | `github.com/UpstageAI/upstage-vllm-amd` (**private**) |
 | Router | ROCm/aiter#5150 + hidden 2048 + FP8 per-token mode @ `9689185d3` (4 commits on `v0.1.23`, `50da036ac`) |
 | Router remote | `github.com/sshlyapn/aiter`, branch `sshliapn/feature/fused_router_0.1.23` |
-| Tuning | `tuning/bf16_tuned_gemms_250b_tp4.csv`, `tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv` (see §Tuning) |
+| Tuning | `tuning/bf16_tuned_gemms_250b_tp4.csv`, `tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv`, `tuning/a4w4_tuned_fmoe_250b_tp4.csv` (see §Tuning) |
 | Target arch | `gfx950` (MI355X only) |
 | AITER / flydsl | `0.1.23` / `0.3.4.1` — not reinstalled |
 
@@ -107,7 +108,10 @@ Check (1) launches nothing. It asserts:
   `AITER_CONFIG_GEMM_BF16` to the baked-in table;
 - AITER resolves `AITER_CONFIG_GEMM_A8W8` to the baked-in 35B FP8 table, and
   `module_gemm_a8w8.so` is newer than that table, i.e. was built from it rather
-  than being the base image's stock copy.
+  than being the base image's stock copy;
+- `AITER_CONFIG_FMOE` is unset, the 250B MoE table is linked into
+  `aiter/configs/model_configs/`, and every one of its 32 shapes resolves
+  through AITER's merged MoE configs to its own tuned kernels.
 
 Check (2) launches the router at two decode shapes — MXFP4 250B (hidden 4096,
 80 experts, topk 7) and FP8 35B (hidden 2048, 128 experts, topk 4) — and
@@ -183,9 +187,11 @@ Baked into `/tuning` — nothing to mount. Named
 |---|---|---|---|
 | `bf16_tuned_gemms_250b_tp4.csv` | `AITER_CONFIG_GEMM_BF16` | yes | 504 rows, 8 N/K pairs, gfx950 / 256 CUs only: the bf16 GEMMs of the 250B at TP4. Kernels: flydsl, hipBLASLt, torch, triton, asm, skinny. |
 | `a8w8_tuned_gemms_35b_fp8_tp1.csv` | `AITER_CONFIG_GEMM_A8W8` | yes, compiled in | 379 rows, gfx950 / 256 CUs only: every FP8 a8w8 linear of the 35B FP8 at TP1 — N/K (2566, 2048), (3072, 128), (3072, 2048), (4096, 2048), (4876, 2048), (9496, 2048). |
+| `a4w4_tuned_fmoe_250b_tp4.csv` | — (`model_configs/`) | merged with stock | 32 rows, gfx950 / 256 CUs only: the 250B MXFP4 (per_1x32) MoE at TP4 + EP, hidden 4096, intermediate 1280, tokens 1–32768. E=80 / topk 8 is the routed experts alone, E=81 / topk 10 the fused shared expert. All FlyDSL 2-stage (`flydsl_moe1_*` + `flydsl_moe2_layout_*`). |
 
-Both share the schema of AITER's stock `configs/bf16_tuned_gemm.csv` /
-`configs/a8w8_tuned_gemm.csv` and replace the stock table wholesale.
+The two GEMM tables share the schema of AITER's stock
+`configs/bf16_tuned_gemm.csv` / `configs/a8w8_tuned_gemm.csv` and replace the
+stock table wholesale. The MoE table does not replace anything; see below.
 
 **bf16** is read at runtime: point `AITER_CONFIG_GEMM_BF16` elsewhere to
 override, no rebuild needed. Shapes outside the table fall back to AITER's
@@ -208,16 +214,32 @@ under `tuning/` and rebuild. The 35B FP8 *requires* it: its KDA `in_proj`
 AITER hands it to `torch._scaled_mm`, which rejects it, and the server fails to
 start. MXFP4 checkpoints run no a8w8 GEMMs and are unaffected.
 
-`AITER_CONFIG_FMOE` is unset, so the MoE configs are AITER's stock table; it
-can be pointed at a mounted table at runtime.
+**fmoe** is read at runtime, through AITER's default resolution rather than an
+env var: with `AITER_CONFIG_FMOE` unset, AITER merges `configs/tuned_fmoe.csv`
+with every `configs/model_configs/*tuned_fmoe*.csv` at startup (into
+`/tmp/aiter_configs/tuned_fmoe.csv`). The table is symlinked there from
+`/tuning`, so the 250B gets its tuned kernels and the 35B MoE shapes keep
+AITER's stock configs. It was tuned with the EP-aware tuner (320 global
+experts, expert mask for EP rank 0 of 4) on the AITER/flydsl the image ships,
+and gives a 1.18x geomean (1.04–1.37x) end-to-end MoE speedup over the
+untuned path across its 32 shapes.
 
-The build fails if either table does not parse, differs in schema from
-AITER's, has null cells, has duplicate index rows (which would make the lookup
-arbitrary), or carries rows for any target other than gfx950 / 256 CUs (for
-a8w8 the codegen would silently drop those rows); if the bf16 table names an
-unknown kernel library; if the a8w8 table has a weight dtype other than fp8;
-and if the number of shapes compiled into `module_gemm_a8w8` differs from the
-a8w8 table's row count.
+Setting `AITER_CONFIG_FMOE` replaces that whole merged set, this table
+included. To add a table instead, list both:
+`-e AITER_CONFIG_FMOE=/tuning/a4w4_tuned_fmoe_250b_tp4.csv:/path/to/b.csv`
+(and `aiter/configs/tuned_fmoe.csv` too, to keep the stock rows). The FlyDSL
+kernels are not precompiled into the image; FlyDSL compiles them on first use.
+
+The build fails if any table does not parse, has null cells, has duplicate
+index rows (which would make the lookup arbitrary), or carries rows for any
+target other than gfx950 / 256 CUs (for a8w8 the codegen would silently drop
+those rows); if a GEMM table differs in schema from AITER's, or the MoE table
+lacks a column of AITER's; if the bf16 table names an unknown kernel library;
+if the a8w8 table has a weight dtype other than fp8; if the MoE table has
+non-MXFP4 weights or non-FlyDSL kernels, or shares a shape key with any stock
+MoE table (AITER's merge would raise on it and rewrite the tables, and the
+lookup would pick the stock row); and if the number of shapes compiled into
+`module_gemm_a8w8` differs from the a8w8 table's row count.
 
 ### Model runner
 
@@ -248,6 +270,7 @@ prefills.
 | `.dockerignore` | keeps `.git` and `__pycache__` out of the context | `docker build` |
 | `tuning/bf16_tuned_gemms_250b_tp4.csv` | AITER bf16 GEMM config, 250B TP4, copied to `/tuning` | in build, step 4b |
 | `tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv` | AITER a8w8 GEMM config, 35B FP8 TP1, copied to `/tuning` | in build, steps 4b and 5 |
+| `tuning/a4w4_tuned_fmoe_250b_tp4.csv` | AITER MXFP4 fused-MoE config, 250B TP4 + EP, copied to `/tuning` and linked into `aiter/configs/model_configs/` | in build, step 4b |
 | `tuning_check.py` | validates the CSVs against AITER's schemas | in build, step 4b |
 | `build_kernel.py` | compiles the router and the a8w8 GEMM into the image | in build, step 5 |
 | `verify.sh` | baked in as `verify-fused-router` | after build, GPU |
@@ -365,7 +388,7 @@ the `.cu` by hand with `hipcc` fails on `torch/all.h` unless you add
 ## Reproducibility
 
 Every input is pinned: both sources by commit, the base image by digest, the
-nine router files, the five stock files they replace, and the two tuning
+nine router files, the five stock files they replace, and the three tuning
 CSVs md5-checked.
 
 Compiled *outputs* are not bit-reproducible — the HIP compiler is
@@ -395,3 +418,10 @@ Built as `vllm-solar:v031` on an MI355X host (gfx950), and tested on GPUs 0–3:
 
 Not verified: `vllm serve` of any checkpoint in this image, benchmarks, and
 accuracy.
+
+The MoE table was added after that build and has not been through
+`docker build` yet. Its step-4b check (`tuning_check.py`) and the new
+`verify-fused-router` lookup were run against the same AITER 0.1.23 + router
+overlay outside Docker: the merge with all 43 stock MoE tables raises no
+duplicate, and all 32 shapes resolve to their tuned kernels on an MI355X. The
+table itself was used by the 250B shared-expert DFlash2 runs on vLLM 0.31.

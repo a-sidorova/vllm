@@ -148,6 +148,7 @@ echo "==> tuning/"
 TUNING_FILES=(
   "bf16_tuned_gemms_250b_tp4.csv:0083abbe110254c422d49b3feadcd5ad"
   "a8w8_tuned_gemms_35b_fp8_tp1.csv:99d452b34d5bc8ea4816edc5cb1ac04a"
+  "a4w4_tuned_fmoe_250b_tp4.csv:d934a6ac9e46821f3f9df573561162a6"
 )
 for entry in "${TUNING_FILES[@]}"; do
     f=${entry%:*}; want=${entry#*:}

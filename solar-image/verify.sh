@@ -131,5 +131,28 @@ assert os.path.isfile(so), f"{so} missing: the a8w8 GEMM was not compiled in"
 print(f"module_gemm_a8w8.so        {os.path.getsize(so)} bytes")
 assert os.path.getmtime(so) >= os.path.getmtime(os.environ["AITER_CONFIG_GEMM_A8W8"]), \
     "module_gemm_a8w8.so is older than the a8w8 table it should be built from"
+
+# The 250B MoE table reaches AITER only through its default merge of
+# model_configs/, which AITER_CONFIG_FMOE replaces. Every row must then resolve
+# to its own kernels, i.e. no other table shadows it.
+import pandas as pd
+import aiter.fused_moe as fm
+fmoe_tbl = "/tuning/a4w4_tuned_fmoe_250b_tp4.csv"
+assert not os.environ.get("AITER_CONFIG_FMOE"), \
+    f"AITER_CONFIG_FMOE={os.environ['AITER_CONFIG_FMOE']} replaces the baked-in MoE tables"
+link = os.path.join(os.path.dirname(fm.__file__), "configs", "model_configs",
+                    os.path.basename(fmoe_tbl))
+assert os.path.realpath(link) == fmoe_tbl, f"{link} does not link to {fmoe_tbl}"
+print(f"AITER_CONFIG_FMOE          {AITER_CONFIGS.AITER_CONFIG_FMOE_FILE} (merged)")
+t = pd.read_csv(fmoe_tbl)
+for r in t.itertuples():
+    md = str(fm.get_2stage_cfgs(
+        r.token, r.model_dim, r.inter_dim, r.expert, r.topk,
+        dtypes.bf16, dtypes.fp4x2, dtypes.fp4x2, QuantType.per_1x32,
+        bool(r.use_g1u1), ActivationType.Silu, bool(r.doweight_stage1), 0, 0, True,
+    ))
+    assert r.kernelName1 in md and r.kernelName2 in md, \
+        f"fmoe token={r.token} E={r.expert} topk={r.topk} does not use its tuned kernels: {md[:200]}"
+print(f"fmoe 250B MXFP4             all {len(t)} rows resolve to their tuned kernels")
 print("\nOK")
 PY
