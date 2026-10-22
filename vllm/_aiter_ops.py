@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import ctypes
 import functools
 import os
@@ -45,6 +46,26 @@ def _is_fp8_e4m3_tensor(t: torch.Tensor | None) -> bool:
     return t is not None and t.dtype in _FP8_E4M3_DTYPES
 
 
+def _aiter_qr_exchange_handles(aiter: Any, ptr: int, world_size: int, group) -> None:
+    try:
+        from aiter.dist.device_communicators.quick_all_reduce import (
+            qr_exchange_handles,
+        )
+    except ImportError:
+        qr_exchange_handles = None
+
+    if qr_exchange_handles is not None:
+        # aiter >= 0.1.19.post1 exchanges IPC handles through host pointers:
+        # qr_get_handle(fa, out_ptr) and qr_open_handles(fa, int[]).
+        qr_exchange_handles(ptr, world_size, group)
+        return
+
+    handle = aiter.qr_get_handle(ptr)
+    handles = [None] * world_size
+    dist.all_gather_object(handles, handle, group=group)
+    aiter.qr_open_handles(ptr, handles)
+
+
 def _get_or_create_aiter_qr_rmsnorm_comm(
     device_comm: Any,
 ) -> tuple[int, int, bool] | None:
@@ -85,13 +106,19 @@ def _get_or_create_aiter_qr_rmsnorm_comm(
     qr_max_size_mb = envs.VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB
     qr_max_size = None if qr_max_size_mb is None else qr_max_size_mb * MB
 
+    ptr = None
     try:
         ptr = aiter.init_custom_qr(rank, world_size, qr_max_size)
-        handle = aiter.qr_get_handle(ptr)
-        handles = [None] * world_size
-        dist.all_gather_object(handles, handle, group=group)
-        aiter.qr_open_handles(ptr, handles)
+        _aiter_qr_exchange_handles(aiter, ptr, world_size, group)
     except Exception:
+        logger.warning(
+            "AITER QuickReduce+RMSNorm fusion disabled: failed to initialize "
+            "the AITER QuickReduce communicator.",
+            exc_info=True,
+        )
+        if ptr is not None:
+            with contextlib.suppress(Exception):
+                aiter.qr_destroy(ptr)
         device_comm._aiter_qr_rmsnorm_comm = False
         return None
 

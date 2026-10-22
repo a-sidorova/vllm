@@ -238,6 +238,139 @@ def test_quick_allreduce_passes_dynamic_quant_level(
     assert called_quant_level == QuickReduceRegime.FP.value
 
 
+_AITER_QR_HELPER_MODULE = "aiter.dist.device_communicators.quick_all_reduce"
+
+
+def _install_fake_aiter(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_aiter: types.SimpleNamespace,
+    qr_exchange_handles=None,
+) -> None:
+    monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
+    if qr_exchange_handles is None:
+        # None in sys.modules makes the import raise ImportError, i.e. an aiter
+        # build that predates qr_exchange_handles.
+        monkeypatch.setitem(sys.modules, _AITER_QR_HELPER_MODULE, None)
+    else:
+        monkeypatch.setitem(
+            sys.modules,
+            _AITER_QR_HELPER_MODULE,
+            types.SimpleNamespace(qr_exchange_handles=qr_exchange_handles),
+        )
+
+
+def _make_qr_rmsnorm_device_comm(
+    monkeypatch: pytest.MonkeyPatch, world_size: int = 2
+) -> SimpleNamespace:
+    monkeypatch.setattr(aiter_ops.dist, "get_world_size", lambda group: world_size)
+    monkeypatch.setattr(aiter_ops.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(envs, "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
+    monkeypatch.setattr(envs, "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", True)
+    return SimpleNamespace(cpu_group=object())
+
+
+def _unexpected_call(*args, **kwargs):
+    raise AssertionError("unexpected call")
+
+
+def test_aiter_qr_rmsnorm_comm_uses_aiter_handle_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device_comm = _make_qr_rmsnorm_device_comm(monkeypatch)
+    exchanged = []
+    fake_aiter = types.SimpleNamespace(
+        init_custom_qr=lambda rank, world_size, qr_max_size: 123,
+        qr_get_handle=_unexpected_call,
+        qr_open_handles=_unexpected_call,
+        qr_destroy=_unexpected_call,
+        qr_all_reduce_rmsnorm=_unexpected_call,
+    )
+    _install_fake_aiter(
+        monkeypatch,
+        fake_aiter,
+        qr_exchange_handles=lambda ptr, world_size, group: exchanged.append(
+            (ptr, world_size, group)
+        ),
+    )
+
+    comm = aiter_ops._get_or_create_aiter_qr_rmsnorm_comm(device_comm)
+
+    assert comm == (123, 2, True)
+    assert exchanged == [(123, 2, device_comm.cpu_group)]
+    assert device_comm._aiter_qr_rmsnorm_comm == comm
+    assert aiter_ops._get_or_create_aiter_qr_rmsnorm_comm(device_comm) is comm
+    assert len(exchanged) == 1
+
+
+def test_aiter_qr_rmsnorm_comm_falls_back_to_legacy_handle_api(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device_comm = _make_qr_rmsnorm_device_comm(monkeypatch, world_size=4)
+    monkeypatch.setattr(
+        aiter_ops.dist,
+        "all_gather_object",
+        lambda handles, handle, group: handles.__setitem__(
+            slice(None), [handle] * len(handles)
+        ),
+    )
+    opened = []
+    fake_aiter = types.SimpleNamespace(
+        init_custom_qr=lambda rank, world_size, qr_max_size: 123,
+        qr_get_handle=lambda ptr: b"handle",
+        qr_open_handles=lambda ptr, handles: opened.append((ptr, handles)),
+        qr_destroy=_unexpected_call,
+        qr_all_reduce_rmsnorm=_unexpected_call,
+    )
+    _install_fake_aiter(monkeypatch, fake_aiter)
+
+    comm = aiter_ops._get_or_create_aiter_qr_rmsnorm_comm(device_comm)
+
+    assert comm == (123, 4, True)
+    assert opened == [(123, [b"handle"] * 4)]
+
+
+def test_aiter_qr_rmsnorm_comm_init_failure_warns_and_frees_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device_comm = _make_qr_rmsnorm_device_comm(monkeypatch)
+    init_calls = []
+    destroyed = []
+    warnings = []
+
+    def fake_init_custom_qr(rank, world_size, qr_max_size):
+        init_calls.append(rank)
+        return 123
+
+    def fake_qr_exchange_handles(ptr, world_size, group):
+        raise TypeError("qr_get_handle() missing 1 required positional argument")
+
+    fake_aiter = types.SimpleNamespace(
+        init_custom_qr=fake_init_custom_qr,
+        qr_destroy=destroyed.append,
+        qr_all_reduce_rmsnorm=_unexpected_call,
+    )
+    _install_fake_aiter(
+        monkeypatch, fake_aiter, qr_exchange_handles=fake_qr_exchange_handles
+    )
+    monkeypatch.setattr(
+        aiter_ops.logger,
+        "warning",
+        lambda msg, *args, **kwargs: warnings.append((msg, kwargs)),
+    )
+
+    assert aiter_ops._get_or_create_aiter_qr_rmsnorm_comm(device_comm) is None
+    assert device_comm._aiter_qr_rmsnorm_comm is False
+    assert destroyed == [123]
+    assert len(warnings) == 1
+    assert "QuickReduce+RMSNorm fusion disabled" in warnings[0][0]
+    assert warnings[0][1].get("exc_info") is True
+
+    # The failure is cached: no second buffer allocation, no repeated warning.
+    assert aiter_ops._get_or_create_aiter_qr_rmsnorm_comm(device_comm) is None
+    assert init_calls == [0]
+    assert len(warnings) == 1
+
+
 def test_rocm_aiter_fused_rmsnorm_uses_aiter_qr_rmsnorm_for_prefill(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -277,17 +410,12 @@ def test_rocm_aiter_fused_rmsnorm_uses_aiter_qr_rmsnorm_for_prefill(
     )
     monkeypatch.setattr(aiter_ops.dist, "get_world_size", lambda group: 2)
     monkeypatch.setattr(aiter_ops.dist, "get_rank", lambda group: 0)
-    monkeypatch.setattr(
-        aiter_ops.dist,
-        "all_gather_object",
-        lambda handles, handle, group: handles.__setitem__(0, handle),
-    )
 
     calls = []
     fake_aiter = types.SimpleNamespace(
         init_custom_qr=lambda rank, world_size, qr_max_size: 123,
-        qr_get_handle=lambda ptr: b"handle",
-        qr_open_handles=lambda ptr, handles: None,
+        qr_get_handle=_unexpected_call,
+        qr_open_handles=_unexpected_call,
     )
 
     def fake_qr_all_reduce_rmsnorm(
@@ -320,7 +448,11 @@ def test_rocm_aiter_fused_rmsnorm_uses_aiter_qr_rmsnorm_for_prefill(
         residual_out.copy_(residual)
 
     fake_aiter.qr_all_reduce_rmsnorm = fake_qr_all_reduce_rmsnorm
-    monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
+    _install_fake_aiter(
+        monkeypatch,
+        fake_aiter,
+        qr_exchange_handles=lambda ptr, world_size, group: None,
+    )
     monkeypatch.setattr(envs, "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
     monkeypatch.setattr(envs, "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", True)
 
@@ -565,6 +697,95 @@ def test_custom_quick_allreduce_bf16_cast(monkeypatch: pytest.MonkeyPatch):
         pytest.skip("Not enough GPUs to run the test.")
     monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "FP")
     multi_process_parallel(monkeypatch, 2, 1, bf16_cast_quickreduce)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def aiter_qr_rmsnorm_fused(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size,
+    pp_size,
+    rank,
+    distributed_init_port,
+):
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        m.delenv("HIP_VISIBLE_DEVICES", raising=False)
+        m.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+        import aiter
+
+        tp_group = get_tp_group()
+        comm = aiter_ops._get_or_create_aiter_qr_rmsnorm_comm(
+            tp_group.device_communicator
+        )
+        assert comm is not None, "AITER QR+RMSNorm communicator failed to init"
+        ptr, world_size, _ = comm
+        assert world_size == tp_size
+
+        try:
+            tokens, hidden_dim, eps = 256, 4096, 1e-6
+            dtype = torch.bfloat16
+            generator = torch.Generator().manual_seed(1234)
+            inputs = [
+                (torch.randn(tokens, hidden_dim, generator=generator) * 0.1).to(dtype)
+                for _ in range(world_size)
+            ]
+            residual = (torch.randn(tokens, hidden_dim, generator=generator) * 0.1).to(
+                dtype
+            )
+            weight = (torch.randn(hidden_dim, generator=generator) * 0.1).to(dtype)
+
+            ref_residual_out = torch.stack(inputs).float().sum(0) + residual.float()
+            variance = ref_residual_out.pow(2).mean(dim=-1, keepdim=True)
+            ref_out = ref_residual_out * torch.rsqrt(variance + eps) * weight.float()
+
+            inp = inputs[rank].to(device)
+            residual = residual.to(device)
+            weight = weight.to(device)
+            out = torch.empty_like(inp)
+            residual_out = torch.empty_like(residual)
+
+            # Align ranks before launching the custom IPC kernel.
+            dist.all_reduce(torch.zeros(1, device=device), group=tp_group.device_group)
+            torch.accelerator.synchronize()
+            aiter.qr_all_reduce_rmsnorm(
+                ptr,
+                inp,
+                residual,
+                residual_out,
+                out,
+                weight,
+                eps,
+                hidden_dim,
+                QuickReduceRegime.FP.value,
+                False,
+            )
+            torch.accelerator.synchronize()
+
+            torch.testing.assert_close(
+                residual_out.cpu().float(), ref_residual_out, atol=4e-2, rtol=4e-2
+            )
+            torch.testing.assert_close(out.cpu().float(), ref_out, atol=4e-2, rtol=4e-2)
+        finally:
+            aiter.qr_destroy(ptr)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="only test quick allreduce for rocm"
+)
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_aiter_qr_rmsnorm_comm_with_real_aiter(
+    monkeypatch: pytest.MonkeyPatch, tp_size
+):
+    if tp_size > torch.accelerator.device_count():
+        pytest.skip("Not enough GPUs to run the test.")
+    aiter = pytest.importorskip("aiter")
+    if not hasattr(aiter, "qr_all_reduce_rmsnorm"):
+        pytest.skip("aiter build has no qr_all_reduce_rmsnorm")
+    multi_process_parallel(monkeypatch, tp_size, 1, aiter_qr_rmsnorm_fused)
 
 
 def qr_variable_input(rank, world_size):
