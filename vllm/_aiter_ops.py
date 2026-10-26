@@ -1212,6 +1212,25 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
             and row_size <= 32 * KB
             and (32 * KB) % row_size == 0
         )
+        if (
+            fused_qr_rmsnorm_ok
+            and not gemma_norm
+            and getattr(qr_comm, "use_flydsl", None) is not None
+            and qr_comm.use_flydsl(input_)
+        ):
+            import aiter
+
+            logger.info_once(
+                "Fused AllReduce+RMSNorm: FlyDSL INT4 QuickReduce + "
+                "AITER add_rmsnorm."
+            )
+            ar_out = qr_comm.quick_all_reduce(input_)
+            out = torch.empty_like(input_)
+            residual_out = torch.empty_like(residual)
+            aiter.rmsnorm2d_fwd_with_add(
+                out, ar_out, residual, residual_out, weight, epsilon, 0
+            )
+            return out, residual_out
         if fused_qr_rmsnorm_ok:
             assert qr_comm is not None
             aiter_qr_comm = _get_or_create_aiter_qr_rmsnorm_comm(device_comm)

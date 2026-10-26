@@ -264,6 +264,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
+    VLLM_ROCM_QUICK_REDUCE_FLYDSL: bool = False
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_MOONCAKE_CONNECTOR_TIMEOUT: float = 30.0
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
@@ -1453,6 +1454,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QuickReduce. This does not affect QuickReduce eligibility.
     "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB": lambda: maybe_convert_int(
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB", None)
+    ),
+    # Run INT4 QuickReduce for bf16 inputs with the AITER FlyDSL kernel
+    # (aiter.ops.flydsl.QuickAllReduceInt4) instead of the HIP kernels, both
+    # in the plain all-reduce path and in the fused AllReduce+RMSNorm path
+    # (FlyDSL all-reduce followed by AITER add+RMSNorm). Size thresholds are
+    # unchanged. Requires VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4.
+    "VLLM_ROCM_QUICK_REDUCE_FLYDSL": lambda: (
+        os.getenv("VLLM_ROCM_QUICK_REDUCE_FLYDSL", "0").lower() in ("true", "1")
     ),
     # If set, enable multiprocessing in LLM for the V1 code path.
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(

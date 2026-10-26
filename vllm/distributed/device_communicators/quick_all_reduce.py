@@ -256,7 +256,47 @@ class QuickAllReduce:
                 self.qr_quantization_min_size // KB,
             )
         self.create_shared_buffer()
+        self.flydsl_qr = None
+        if envs.VLLM_ROCM_QUICK_REDUCE_FLYDSL:
+            self._init_flydsl_qr()
         self.disabled = False
+
+    def _init_flydsl_qr(self):
+        if self.qr_quant_level != QuickReduceRegime.INT4:
+            logger.warning(
+                "VLLM_ROCM_QUICK_REDUCE_FLYDSL ignored: the FlyDSL kernel only "
+                "implements INT4, got %s.",
+                self.qr_quant_level.name,
+            )
+            return
+        from aiter.ops.flydsl import QuickAllReduceInt4
+
+        fly = QuickAllReduceInt4(
+            group=self.group,
+            device=self.device,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+        # The first launch JIT-compiles and is a collective, so compile every
+        # engine here while all ranks are in lockstep.
+        buf = torch.zeros((512, 4096), dtype=torch.bfloat16, device=self.device)
+        fly.compile(buf, torch.empty_like(buf))
+        torch.cuda.synchronize(self.device)
+        self.flydsl_qr = fly
+        logger.info(
+            "Custom quick allreduce: bf16 INT4 uses the AITER FlyDSL kernel "
+            "(grids=%s).",
+            {st: eng.grid for st, eng in fly._by_st.items()},
+        )
+
+    def use_flydsl(self, inp: torch.Tensor) -> bool:
+        return (
+            self.flydsl_qr is not None
+            and inp.dtype == torch.bfloat16
+            and inp.is_contiguous()
+            and inp.data_ptr() % 16 == 0
+            and self._get_qr_quant_level(inp) == QuickReduceRegime.INT4.value
+        )
 
     @staticmethod
     def _get_qr_min_size(qr_max_size: int | None) -> int | None:
@@ -339,6 +379,9 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        if self.use_flydsl(inp):
+            self.flydsl_qr.allreduce(inp, out)
+            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self._get_qr_quant_level(inp), self.use_fp16_kernels
         )
@@ -354,6 +397,10 @@ class QuickAllReduce:
         return self.qr_quant_level.value
 
     def close(self):
+        fly = getattr(self, "flydsl_qr", None)
+        if fly is not None:
+            fly.close()
+            self.flydsl_qr = None
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
