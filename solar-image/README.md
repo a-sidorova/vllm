@@ -1,22 +1,30 @@
-# Solar-Open2 (MXFP4 + FP8) — v0.31.0 fused-router image
+# Solar-Open2 — vLLM v0.31.0 version optimized on MI355X
 
 vLLM ROCm image for Solar-Open2 on MI355X:
 
 > Baseline + eliminated element-wise small kernels + fused MoE-router kernel
 > (`VLLM_ROCM_USE_AITER_FUSED_ROUTER=1`, ROCm/aiter#5150) for **MXFP4 and FP8
 > per-token** experts + DFlash and fused KDA under speculative decoding +
-> tuned GEMMs for the 250B at TP4 (bf16) and the 35B FP8 at TP1 (a8w8) +
-> tuned MXFP4 fused MoE for the 250B at TP4 + EP.
+> optional FlyDSL INT4 QuickReduce + gfx950 Gluon unified attention tuned for
+> spec decode (ROCm/aiter#6336) + tuned GEMMs for the 250B at TP4 (bf16) and
+> the 35B FP8 at TP1 (a8w8) + tuned MXFP4 fused MoE for the 250B at TP4 + EP.
 
 Built from the current heads of the two branches:
 
-- engine `asidorov/port/solar-v0.31.0` @ `c59be78a58` — the Solar-Open2 series
+- engine `asidorov/port/solar-v0.31.0` @ `60d7421943` — the Solar-Open2 series
   and the fused router as in the previous image (`d05acb0848`), plus DFlash
   (`d0d51f2832`), FULL-decode cudagraph regression tests (`63cacdf1e8`), the
-  fused KDA path under speculative decoding (`0404794356`) and
-  `VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND` (`c59be78a58`);
-- router `sshliapn/feature/fused_router_0.1.23` @ `9689185d3` — AITER v0.1.23
-  (the AITER the base image ships) plus four router commits.
+  fused KDA path under speculative decoding (`0404794356`),
+  `VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND` (`c59be78a58`), the QuickReduce+RMSNorm
+  fusion fix for aiter >= 0.1.19.post1 (`81304a9419`) and the optional FlyDSL
+  INT4 QuickReduce backend (`60d7421943`);
+- aiter `sshliapn/feature/fused_router_0.1.23` @ `16dc176bf` — AITER v0.1.23
+  (the AITER the base image ships) plus four router commits and
+  ROCm/aiter#6336 (gfx950 Gluon unified attention for spec decode).
+
+This is the engine + AITER that the
+`vllm_0.31_fix_gluon_tuned_moe_flydsl_qr` (cfg10) benchmark campaign ran on:
+the AITER the image assembles is byte-identical to `16dc176bf`.
 
 One image serves all three checkpoints; only the launch arguments differ. The
 35B MXFP4 and 35B FP8 run TP1; the 250B MXFP4 runs TP4 with expert parallel,
@@ -29,10 +37,10 @@ Self-contained: engine, router kernel and tuning are all in the image.
 | | Value |
 |---|---|
 | Base image | `vllm/vllm-openai-rocm:v0.31.0`, pinned by digest `sha256:749f6f3f…` |
-| Engine | `asidorov/port/solar-v0.31.0` @ `c59be78a58` (`v0.31.0` + 24 commits) |
+| Engine | `asidorov/port/solar-v0.31.0` @ `60d7421943` (`v0.31.0` + 31 commits) |
 | Engine remote | `github.com/UpstageAI/upstage-vllm-amd` (**private**) |
-| Router | ROCm/aiter#5150 + hidden 2048 + FP8 per-token mode @ `9689185d3` (4 commits on `v0.1.23`, `50da036ac`) |
-| Router remote | `github.com/sshlyapn/aiter`, branch `sshliapn/feature/fused_router_0.1.23` |
+| AITER | ROCm/aiter#5150 + hidden 2048 + FP8 per-token mode + ROCm/aiter#6336 @ `16dc176bf` (5 commits on `v0.1.23`, `50da036ac`) |
+| AITER remote | `github.com/sshlyapn/aiter`, branch `sshliapn/feature/fused_router_0.1.23` |
 | Tuning | `tuning/bf16_tuned_gemms_250b_tp4.csv`, `tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv`, `tuning/a4w4_tuned_fmoe_250b_tp4.csv` (see §Tuning) |
 | Target arch | `gfx950` (MI355X only) |
 | AITER / flydsl | `0.1.23` / `0.3.4.1` — not reinstalled |
@@ -54,24 +62,24 @@ docker build -t vllm-solar:v031 .
 `fetch-sources.sh` takes both sources from local checkouts when they have the
 pinned commits, and only goes to the network otherwise:
 
-- the engine is exported from `c59be78a58` in the checkout this directory lives
+- the engine is exported from `60d7421943` in the checkout this directory lives
   in (`VLLM_GIT` to override). Do not `--depth 1` the clone; on a shallow clone
   it falls back to fetching that commit from the private remote;
 - AITER is read from an `aiter` checkout next to `upstage-vllm-amd`
-  (`AITER_GIT` to override). Without one, it fetches the router commit and
-  `v0.1.23` by SHA from `github.com/sshlyapn/aiter`.
+  (`AITER_GIT` to override). Without one, it fetches `16dc176bf` and `v0.1.23`
+  by SHA from `github.com/sshlyapn/aiter`.
 
-It pins both revisions by commit, checks that the router commits touch exactly
-the nine overlay files and md5-checks them, and md5-checks the tuning CSVs, so it
-either reproduces the exact intended inputs or fails loudly. It also writes
-`aiter-overlay/stock.md5`: what the five files the router *modifies* hash to at
-`v0.1.23`. `docker build` checks the base image's installed copies against it
-before overlaying (step 3), so a base image with any other AITER fails the
-build rather than producing a mixed AITER.
+It pins both revisions by commit, checks that the AITER commits touch exactly
+the fifteen overlay files and md5-checks them, and md5-checks the tuning CSVs,
+so it either reproduces the exact intended inputs or fails loudly. It also
+writes `aiter-overlay/stock.md5`: what the eleven files the branch *modifies*
+hash to at `v0.1.23`. `docker build` checks the base image's installed copies
+against it before overlaying (step 3), so a base image with any other AITER
+fails the build rather than producing a mixed AITER.
 
 To build from newer commits on either branch, update `VLLM_COMMIT` /
 `AITER_COMMIT` and the overlay md5s in `fetch-sources.sh`. As long as the
-router branch stays on `v0.1.23` and only touches those nine files, nothing
+AITER branch stays on `v0.1.23` and only touches those fifteen files, nothing
 else changes; if it touches another file, `fetch-sources.sh` says which.
 
 Outside Docker on a 256-core host: ~4 min for `_rocm_C`, ~35 s for the
@@ -106,6 +114,10 @@ Check (1) launches nothing. It asserts:
   `AiterFusedRouterExperts`, and `QuarkW8A8Fp8MoEMethod` has `apply_monolithic`;
 - `module_fused_moe_router.so` is compiled in, and AITER resolves
   `AITER_CONFIG_GEMM_BF16` to the baked-in table;
+- vLLM has the QuickReduce+RMSNorm handle-exchange fix and the FlyDSL INT4
+  QuickReduce backend, and AITER ships `QuickAllReduceInt4`;
+- the unified attention module vLLM's `ROCM_AITER_UNIFIED_ATTN` backend imports
+  carries ROCm/aiter#6336;
 - AITER resolves `AITER_CONFIG_GEMM_A8W8` to the baked-in 35B FP8 table, and
   `module_gemm_a8w8.so` is newer than that table, i.e. was built from it rather
   than being the base image's stock copy;
@@ -121,8 +133,8 @@ means the router was not compiled into the image.
 ### Test suites
 
 The image carries neither test tree, so mount them from the same commits the
-image was built from (`aiter` at `9689185d3`, `upstage-vllm-amd` at
-`c59be78a58`). `pytest` is in the base image; vLLM's `conftest.py` also needs
+image was built from (`aiter` at `16dc176bf`, `upstage-vllm-amd` at
+`60d7421943`). `pytest` is in the base image; vLLM's `conftest.py` also needs
 `tblib` and `anthropic`, installed into the throwaway container below.
 
 ```bash
@@ -170,7 +182,8 @@ then picks `ROCM_AITER_FA`. It assumes the default environment; with
 
 The router's multi-GPU stress harness
 (`op_tests/multigpu_tests/test_fused_moe_router_stress.py`, run with
-`HIP_VISIBLE_DEVICES=0,1,2,3`) is stale at `9689185d3`. It still uses the
+`HIP_VISIBLE_DEVICES=0,1,2,3`) is stale at `16dc176bf` (unchanged since
+`9689185d3`). It still uses the
 pre-FP8 buffer names `o4`/`osc` (now `a1`/`a1s`) and calls `_deswizzle()`
 without the `scale_n` argument, so it dies with `KeyError: 'o4'`. Patched for
 those two changes, it passes all 12 suites.
@@ -249,6 +262,31 @@ V1-interface `SolarOpen2TemplateLogitsProcessor` at startup, so a launch that
 passes `--logits-processors=...SolarOpen2TemplateLogitsProcessor` needs
 `-e VLLM_USE_V2_MODEL_RUNNER=0`.
 
+### QuickReduce
+
+TP all-reduces use vLLM's QuickReduce when
+`VLLM_ROCM_QUICK_REDUCE_QUANTIZATION` is set (cfg10 uses `INT4`). The
+AllReduce+RMSNorm fusion on that path now initializes against AITER 0.1.23's
+IPC handle API; before `81304a9419` it failed silently and 256–8192-token
+all-reduces fell back to bf16 CustomAllreduce.
+
+`-e VLLM_ROCM_QUICK_REDUCE_FLYDSL=1` (default off, INT4 only) swaps the HIP
+INT4 kernel for AITER's FlyDSL `QuickAllReduceInt4`, which ships in stock
+AITER 0.1.23. It JIT-compiles at startup, while the ranks are in lockstep.
+Confirm it in the startup log:
+
+```
+Custom quick allreduce: bf16 INT4 uses the AITER FlyDSL kernel (grids=...)
+Fused AllReduce+RMSNorm: FlyDSL INT4 QuickReduce + AITER add_rmsnorm.
+```
+
+### Unified attention
+
+With `--attention-backend=ROCM_AITER_UNIFIED_ATTN` and
+`VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND=auto`, AITER picks its gfx950 Gluon
+kernel. ROCm/aiter#6336 gives spec-decode verify batches (`max_seqlen_q` =
+K+1, not pure decode) the split grid; the image carries it.
+
 ### Confirming the router engaged
 
 `AiterFusedRouterExperts` is a Python class, so it never appears in a rocprof
@@ -281,25 +319,26 @@ should be committed.
 
 ## How it works
 
-**Engine (steps 1–2).** The branch is `v0.31.0` + 24 commits, and its only
+**Engine (steps 1–2).** The branch is `v0.31.0` + 31 commits, and its only
 non-Python file is `csrc/rocm/skinny_gemms.cu` (wvSplitK out-of-bounds fix,
 `f40c0bee45`; stock v0.31.0 does not carry it). The commits since the previous
 image (DFlash, fused KDA under spec decode, the unified-attention backend
-switch) are Python and tests only. That one `.cu` file is the entire reason a
+switch, the QuickReduce fixes, MoRIIO) are Python and tests only. That one `.cu` file is the entire reason a
 compile happens. Step 1 configures the tree with CMake and builds the
 `_rocm_C` target alone, since `skinny_gemms.cu` lands in that module only; the
 result (~130 MB, gfx950) replaces the image's copy. The Python tree is then
 copied over the installed package. The archive carries no `_version.py`, so
 the image's copy stays and vLLM keeps reporting `0.31.0+rocm723`.
 
-**Router (step 3).** Injected as nine files rather than by reinstalling AITER.
-This is safe because the branch sits on exactly the AITER revision the image
-ships: `v0.1.23` (`50da036ac`), then the MXFP4 router (`6e84d85e2`), hidden
-2048 (`25c12fea1`), the FP8 mode (`331970f9e`) and the sort-extent padding fix
-(`9689185d3`). Five of the nine files exist at `v0.1.23` and are modified; the
-build first checks that the image's copies are byte-identical to `v0.1.23`
-(`stock.md5`), then overwrites them. The other four are new. So no AITER drift
-and no flydsl bump.
+**AITER (step 3).** Injected as fifteen files rather than by reinstalling
+AITER. This is safe because the branch sits on exactly the AITER revision the
+image ships: `v0.1.23` (`50da036ac`), then the MXFP4 router (`6e84d85e2`),
+hidden 2048 (`25c12fea1`), the FP8 mode (`331970f9e`), the sort-extent padding
+fix (`9689185d3`) and the gfx950 Gluon unified attention change
+(ROCm/aiter#6336, `16dc176bf`, Python and JSON only). Eleven of the fifteen
+files exist at `v0.1.23` and are modified; the build first checks that the
+image's copies are byte-identical to `v0.1.23` (`stock.md5`), then overwrites
+them. The other four are new. So no AITER drift and no flydsl bump.
 
 Files land in two trees because AITER resolves kernel sources and headers from
 `aiter_meta/` (a *sibling* of `aiter/`) but reads the build registry from the
@@ -308,7 +347,12 @@ package:
 ```
 aiter/fused_moe.py, aiter/__init__.py,
 aiter/ops/fused_moe_router.py,
-aiter/jit/optCompilerConfig.json             -> package
+aiter/jit/optCompilerConfig.json,
+aiter/ops/triton/attention/unified_attention.py,
+aiter/ops/triton/_triton_kernels/attention/unified_attention.py,
+aiter/ops/triton/_gluon_kernels/gfx950/attention/unified_attention.py,
+aiter/ops/triton/configs/{gfx942/triton,gfx950/triton,gfx950/gluon}/
+    attention/unified_attention/DEFAULT.json -> package
 csrc/kernels/fused_moe_router.cu,
 csrc/pybind/fused_moe_router_pybind.cu,
 csrc/include/fused_moe_router.h,
@@ -388,8 +432,8 @@ the `.cu` by hand with `hipcc` fails on `torch/all.h` unless you add
 ## Reproducibility
 
 Every input is pinned: both sources by commit, the base image by digest, the
-nine router files, the five stock files they replace, and the three tuning
-CSVs md5-checked.
+fifteen AITER overlay files, the eleven stock files they replace, and the three
+tuning CSVs md5-checked.
 
 Compiled *outputs* are not bit-reproducible — the HIP compiler is
 nondeterministic. Two builds of the 8 Sep image from identical sources produced
@@ -398,7 +442,25 @@ Judge these artifacts by behaviour, not by hash.
 
 ## Status
 
-Built as `vllm-solar:v031` on an MI355X host (gfx950), and tested on GPUs 0–3:
+**Current pins (`60d7421943` / `16dc176bf`)** have not been through
+`docker build` yet (no docker on the editing host). Each build step was run
+outside Docker on an MI355X, inside the same `vllm-openai-rocm:v0.31.0` base,
+against a site-packages assembled the way the Dockerfile assembles it:
+
+- `fetch-sources.sh` passes from the local `aiter` checkout and fetched from
+  `github.com/sshlyapn/aiter`; the two give a byte-identical `aiter-overlay/`.
+- Step 1: `_rocm_C` builds from `vllm-src/` (131 MB, gfx950 only).
+- Step 3: all eleven `stock.md5` entries match both git `v0.1.23` and the
+  sha256s in the base image's `amd_aiter-0.1.23.dist-info/RECORD`. Stock
+  `v0.1.23` + overlay is byte-identical to `16dc176bf` (2662 files).
+- Steps 4 and 4b: every check passes, cut verbatim from the Dockerfile. The new
+  QuickReduce and `_gfx950_split_grid` checks fail on the previous pins.
+- Step 5: `module_fused_moe_router` in 37 s (7.2 MB), `module_gemm_a8w8` in
+  11.3 min with all 379 tuned shapes in the lookup header.
+- `verify-fused-router` OK and `router_smoke.py` OK on GPU 0.
+
+Previous pins (`c59be78a58` / `9689185d3`): built as `vllm-solar:v031` on an
+MI355X host (gfx950), and tested on GPUs 0–3:
 
 - `fetch-sources.sh` passes both ways: from the local `aiter` checkout, and
   fetched from `github.com/sshlyapn/aiter` with no checkout. The two give a

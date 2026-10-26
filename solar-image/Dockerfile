@@ -1,16 +1,19 @@
 # Solar-Open2 v0.31.0 image: the Solar-Open2 port onto vLLM v0.31.0 (fused MoE
 # router for MXFP4 and FP8 per-token experts, DFlash, fused KDA under
-# speculative decoding) plus the 250B TP4 bf16 GEMM tuning, the 35B FP8 TP1
-# a8w8 GEMM tuning and the 250B TP4+EP MXFP4 fused-MoE tuning.
+# speculative decoding, FlyDSL INT4 QuickReduce) plus the 250B TP4 bf16 GEMM
+# tuning, the 35B FP8 TP1 a8w8 GEMM tuning and the 250B TP4+EP MXFP4 fused-MoE
+# tuning.
 #
 # Base: stock vllm/vllm-openai-rocm:v0.31.0. AITER and flydsl are NOT replaced -
-# the router is injected as a nine-file overlay onto the AITER the image already
-# ships (amd-aiter 0.1.23 / flydsl 0.3.4.1), and its module is compiled here.
+# the router and the Gluon unified-attention change are injected as a
+# fifteen-file overlay onto the AITER the image already ships (amd-aiter 0.1.23
+# / flydsl 0.3.4.1), and the router module is compiled here.
 #
 #   engine  asidorov/port/solar-v0.31.0
-#           c59be78a58fb2682a97beb0551b1b655bb1d0815  (v0.31.0 + 24 commits)
-#   router  ROCm/aiter#5150 + hidden 2048 + FP8 per-token mode, sshlyapn/aiter
-#           sshliapn/feature/fused_router_0.1.23 @ 9689185d3 (v0.1.23 + 4)
+#           60d742194340ee171246dbf4b3693783b3f81522  (v0.31.0 + 31 commits)
+#   aiter   ROCm/aiter#5150 + hidden 2048 + FP8 per-token mode + ROCm/aiter#6336,
+#           sshlyapn/aiter sshliapn/feature/fused_router_0.1.23 @ 16dc176bf
+#           (v0.1.23 + 5)
 #
 # One image serves the MXFP4 (35B, 250B) and FP8 (35B) checkpoints; only the
 # launch arguments differ.
@@ -71,11 +74,13 @@ RUN set -eu; \
     rm -rf /vllm_src
 
 # ---------------------------------------------------------------------------
-# 3. AITER fused router (aiter#5150 + hidden 2048 + FP8 per-token),
+# 3. AITER fused router (aiter#5150 + hidden 2048 + FP8 per-token) and the
+#    gfx950 Gluon unified attention spec-decode change (aiter#6336),
 #    overlay-style. The branch is v0.1.23 (50da036ac), the revision the image
-#    ships, plus four router commits, so no AITER reinstall and no flydsl bump.
+#    ships, plus four router commits and aiter#6336, so no AITER reinstall and
+#    no flydsl bump. aiter#6336 is Python and JSON only.
 #
-#    That only holds while the five files the commits modify are still the
+#    That only holds while the eleven files the commits modify are still the
 #    stock v0.1.23 copies, so check that first (stock.md5, written by
 #    fetch-sources.sh from the base commit): a base image with a different
 #    AITER fails here instead of getting a half-old, half-new AITER.
@@ -107,8 +112,12 @@ RUN find ${SITE_PACKAGES}/aiter -name '__pycache__' -type d -exec rm -rf {} +
 #    AITER's fused-mode table, and on the engine the FP8 quant-method mapping,
 #    the FP8 oracle offering the router, and Quark FP8's apply_monolithic (the
 #    MXFP4 method already has one, so a plain grep would pass without it).
-#    The last two greps pin the engine past d05acb0848: fused KDA under spec
-#    decode and the unified-attention backend switch.
+#    The KDA and unified-attention greps pin the engine past d05acb0848: fused
+#    KDA under spec decode and the unified-attention backend switch. The
+#    QuickReduce greps pin it past 60d7421943: the QR+RMSNorm handle exchange
+#    for aiter >= 0.1.19.post1 (without it the fusion is silently disabled) and
+#    the FlyDSL INT4 backend, whose kernel ships in stock AITER 0.1.23. The
+#    _gfx950_split_grid grep proves aiter#6336 landed.
 # ---------------------------------------------------------------------------
 RUN set -eu; \
     test -f ${SITE_PACKAGES}/vllm/_rust_tool_parser.abi3.so; \
@@ -131,6 +140,12 @@ RUN set -eu; \
     python3 -c "import ast,sys; t=ast.parse(open('${SITE_PACKAGES}/vllm/model_executor/layers/quantization/quark/quark_moe.py').read()); c=[n for n in t.body if isinstance(n,ast.ClassDef) and n.name=='QuarkW8A8Fp8MoEMethod']; sys.exit(0 if c and any(isinstance(f,ast.FunctionDef) and f.name=='apply_monolithic' for f in c[0].body) else 'QuarkW8A8Fp8MoEMethod.apply_monolithic missing')"; \
     grep -q 'VLLM_KDA_SPEC_DECODE' ${SITE_PACKAGES}/vllm/envs.py; \
     grep -q 'VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND' ${SITE_PACKAGES}/vllm/envs.py; \
+    grep -q 'def _aiter_qr_exchange_handles' ${SITE_PACKAGES}/vllm/_aiter_ops.py; \
+    grep -q 'VLLM_ROCM_QUICK_REDUCE_FLYDSL' ${SITE_PACKAGES}/vllm/envs.py; \
+    grep -q 'def use_flydsl' ${SITE_PACKAGES}/vllm/distributed/device_communicators/quick_all_reduce.py; \
+    grep -q 'def qr_exchange_handles' ${SITE_PACKAGES}/aiter/dist/device_communicators/quick_all_reduce.py; \
+    grep -q '"QuickAllReduceInt4"' ${SITE_PACKAGES}/aiter/ops/flydsl/__init__.py; \
+    grep -q 'def _gfx950_split_grid' ${SITE_PACKAGES}/aiter/ops/triton/attention/unified_attention.py; \
     python3 -c "import vllm.model_executor.models.solar_open2, vllm.reasoning, vllm.tool_parsers"
 
 COPY verify.sh /usr/local/bin/verify-fused-router
@@ -173,8 +188,8 @@ ENV VLLM_ROCM_USE_AITER=1
 ENV VLLM_ROCM_USE_AITER_FUSED_ROUTER=1
 
 RUN printf '%s\n' \
-    'engine: asidorov/port/solar-v0.31.0 @ c59be78a58 (v0.31.0 + 24 commits)' \
-    'router: ROCm/aiter#5150 + hidden 2048 + FP8 per-token (9689185d3) overlay on amd-aiter 0.1.23 (flydsl 0.3.4.1)' \
+    'engine: asidorov/port/solar-v0.31.0 @ 60d7421943 (v0.31.0 + 31 commits)' \
+    'aiter: ROCm/aiter#5150 + hidden 2048 + FP8 per-token + ROCm/aiter#6336 (16dc176bf) overlay on amd-aiter 0.1.23 (flydsl 0.3.4.1)' \
     'PYTORCH_ROCM_ARCH: gfx950' \
     'AITER_CONFIG_GEMM_BF16: /tuning/bf16_tuned_gemms_250b_tp4.csv (250B TP4)' \
     'AITER_CONFIG_GEMM_A8W8: /tuning/a8w8_tuned_gemms_35b_fp8_tp1.csv (compiled into module_gemm_a8w8.so)' \

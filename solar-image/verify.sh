@@ -113,6 +113,27 @@ so = os.path.join(core.get_user_jit_dir(), "module_fused_moe_router.so")
 assert os.path.isfile(so), f"{so} missing: the router was not compiled in"
 print(f"module_fused_moe_router.so {os.path.getsize(so)} bytes")
 
+# QuickReduce: the QR+RMSNorm fusion exchanges IPC handles through AITER's
+# qr_exchange_handles (else the fusion is silently disabled), and
+# VLLM_ROCM_QUICK_REDUCE_FLYDSL=1 dispatches bf16 INT4 to QuickAllReduceInt4.
+from aiter.dist.device_communicators.quick_all_reduce import qr_exchange_handles
+from aiter.ops.flydsl import QuickAllReduceInt4
+import vllm._aiter_ops as vllm_aiter_ops
+from vllm.distributed.device_communicators.quick_all_reduce import QuickAllReduce
+assert hasattr(vllm_aiter_ops, "_aiter_qr_exchange_handles"), \
+    "vllm/_aiter_ops.py predates the QR+RMSNorm handle-exchange fix"
+assert hasattr(QuickAllReduce, "use_flydsl"), \
+    "vllm QuickAllReduce has no FlyDSL INT4 backend"
+print(f"QuickReduce                qr_exchange_handles + {QuickAllReduceInt4.__name__} "
+      f"(VLLM_ROCM_QUICK_REDUCE_FLYDSL={envs.VLLM_ROCM_QUICK_REDUCE_FLYDSL})")
+
+# The module vLLM's ROCM_AITER_UNIFIED_ATTN backend imports must carry
+# aiter#6336 (gfx950 Gluon split grid for spec-decode verify batches).
+import aiter.ops.triton.unified_attention as aiter_ua
+assert hasattr(aiter_ua, "_gfx950_split_grid"), \
+    f"{aiter_ua.__file__} predates aiter#6336"
+print(f"unified attention          aiter#6336 ({aiter_ua.__file__})")
+
 # AITER resolves the bf16 table once, at import.
 from aiter.jit.core import AITER_CONFIGS
 bf16 = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE

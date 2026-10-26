@@ -2,9 +2,9 @@
 # Regenerate the two source trees the Dockerfile consumes, from git pins.
 #
 #   vllm-src/       engine branch, exported with `git archive`
-#   aiter-overlay/  the nine router files, exported from the aiter router branch,
-#                   plus stock.md5: what the five files the router modifies
-#                   must hash to in the base image before they are replaced
+#   aiter-overlay/  the fifteen files the aiter branch changes, exported from it,
+#                   plus stock.md5: what the eleven files it modifies must hash
+#                   to in the base image before they are replaced
 #
 # Both are pinned by commit and checked against recorded md5s, so a re-run on
 # another host produces byte-identical inputs or fails loudly.
@@ -21,20 +21,23 @@ cd "$(dirname "$0")"
 VLLM_REMOTE=https://github.com/UpstageAI/upstage-vllm-amd
 VLLM_REF=asidorov/port/solar-v0.31.0
 # The v0.31.0 port: Solar-Open2, the MXFP4 + FP8 fused router, DFlash, fused
-# KDA under speculative decoding, VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND. The
-# branch tip may carry later changes to this directory only; the image is built
-# from this commit.
-VLLM_COMMIT=c59be78a58fb2682a97beb0551b1b655bb1d0815
+# KDA under speculative decoding, VLLM_ROCM_AITER_UNIFIED_ATTN_BACKEND, the
+# QuickReduce+RMSNorm fusion fix for aiter >= 0.1.19.post1 and the optional
+# FlyDSL INT4 QuickReduce backend (VLLM_ROCM_QUICK_REDUCE_FLYDSL). The branch
+# tip may carry later changes to this directory only; the image is built from
+# this commit.
+VLLM_COMMIT=60d742194340ee171246dbf4b3693783b3f81522
 
 AITER_REMOTE=https://github.com/sshlyapn/aiter.git
 AITER_REF=sshliapn/feature/fused_router_0.1.23
-AITER_COMMIT=9689185d39545469e0f0ea83c4c342b8a94723b5
+AITER_COMMIT=16dc176bf721955f61905a98a2fb57d0aa6525fe
 # v0.1.23, the AITER the base image ships (AITER_BRANCH in /app/versions.txt).
-# The router branch is this plus four commits.
+# The branch is this plus four router commits and the gfx950 Gluon unified
+# attention spec-decode change (ROCm/aiter#6336).
 AITER_BASE=50da036acdedec2dd596f93188d6c615e2561672
 
 # The overlay, and the md5 each file must have at $AITER_COMMIT: every file the
-# router commits touch on top of v0.1.23, except tests and CI.
+# branch touches on top of v0.1.23, except tests and CI.
 OVERLAY_FILES=(
   "aiter/fused_moe.py:9a894f77b047c2454fe110badbfc19da"
   "aiter/__init__.py:0d51cd0f9ee13174c19ba911c9252c2a"
@@ -45,6 +48,12 @@ OVERLAY_FILES=(
   "csrc/include/rocm_ops.hpp:fd1226385e80344a97a5770d68d42dc2"
   "csrc/kernels/fused_moe_router.cu:1d28617ff78d9c0e6e45704a459ad7e8"
   "csrc/pybind/fused_moe_router_pybind.cu:023dcc6c219d4ea9942edea0c6d6947b"
+  "aiter/ops/triton/_gluon_kernels/gfx950/attention/unified_attention.py:12654179a0cc01324fe97aa4301b567f"
+  "aiter/ops/triton/_triton_kernels/attention/unified_attention.py:68b4972af5413c57ab767190dca07194"
+  "aiter/ops/triton/attention/unified_attention.py:34696e29bc0ed94394168e63c6bd3b9c"
+  "aiter/ops/triton/configs/gfx942/triton/attention/unified_attention/DEFAULT.json:8bf11cd16c130fdc0744ba5a09cfc5e7"
+  "aiter/ops/triton/configs/gfx950/gluon/attention/unified_attention/DEFAULT.json:8955b032aec06a8fffc60a7bfbb51f78"
+  "aiter/ops/triton/configs/gfx950/triton/attention/unified_attention/DEFAULT.json:8ce07cd8f8bf86f3d417b8402cdfb28e"
 )
 
 has_commit() { git -C "$1" cat-file -e "$2^{commit}" 2>/dev/null; }
