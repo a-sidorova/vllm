@@ -37,6 +37,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
+from vllm.distributed.device_communicators.quick_all_reduce import quick_reduce_role
 from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -909,7 +910,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
-            with use_workspace_lane(self._draft_workspace_lane):
+            with (
+                use_workspace_lane(self._draft_workspace_lane),
+                quick_reduce_role("draft"),
+            ):
                 self.speculator.propose(
                     input_batch=input_batch,
                     attn_metadata=attn_metadata,
@@ -1062,7 +1066,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         ),
                     )
                     if self.speculator is not None:
-                        with use_workspace_lane(self._draft_workspace_lane):
+                        with (
+                            use_workspace_lane(self._draft_workspace_lane),
+                            quick_reduce_role("draft"),
+                        ):
                             self.speculator.capture()
                     if self.adaptive_verification is not None:
                         with self.step_timing.collect() as timings:
@@ -2200,7 +2207,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
-            with use_workspace_lane(self._draft_workspace_lane):
+            with (
+                use_workspace_lane(self._draft_workspace_lane),
+                quick_reduce_role("draft"),
+            ):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,

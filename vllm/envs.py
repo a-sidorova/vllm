@@ -265,6 +265,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_FLYDSL: bool = False
+    VLLM_ROCM_QUICK_REDUCE_FLYDSL_SCOPE: str = "both"
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_MOONCAKE_CONNECTOR_TIMEOUT: float = 30.0
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
@@ -1463,6 +1464,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_QUICK_REDUCE_FLYDSL": lambda: (
         os.getenv("VLLM_ROCM_QUICK_REDUCE_FLYDSL", "0").lower() in ("true", "1")
     ),
+    # Which model's QuickReduce calls use the FlyDSL kernel when
+    # VLLM_ROCM_QUICK_REDUCE_FLYDSL=1: "both", "target" or "draft"
+    # (speculative decoding drafter); the others keep the HIP kernel.
+    # "none" initializes FlyDSL without using it (diagnostics); "all" is
+    # accepted as "both".
+    "VLLM_ROCM_QUICK_REDUCE_FLYDSL_SCOPE": lambda: (
+        os.getenv("VLLM_ROCM_QUICK_REDUCE_FLYDSL_SCOPE") or "both"
+    ).lower(),
     # If set, enable multiprocessing in LLM for the V1 code path.
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 from enum import Enum
 
 import torch
@@ -39,6 +40,21 @@ class QuickReduceRegime(Enum):
 
 KB = 1024
 MB = 1024 * KB
+
+# Which model issues the current QuickReduce calls: "target" or "draft".
+_qr_role = "target"
+
+
+@contextlib.contextmanager
+def quick_reduce_role(role: str):
+    """Tag QuickReduce calls inside the block with *role*."""
+    global _qr_role
+    prev = _qr_role
+    _qr_role = role
+    try:
+        yield
+    finally:
+        _qr_role = prev
 
 
 class QuickAllReduce:
@@ -257,6 +273,14 @@ class QuickAllReduce:
             )
         self.create_shared_buffer()
         self.flydsl_qr = None
+        self.flydsl_scope = envs.VLLM_ROCM_QUICK_REDUCE_FLYDSL_SCOPE
+        if self.flydsl_scope == "all":
+            self.flydsl_scope = "both"
+        if self.flydsl_scope not in ("both", "target", "draft", "none"):
+            raise ValueError(
+                "VLLM_ROCM_QUICK_REDUCE_FLYDSL_SCOPE must be both, target, draft "
+                f"or none, got {self.flydsl_scope!r}"
+            )
         if envs.VLLM_ROCM_QUICK_REDUCE_FLYDSL:
             self._init_flydsl_qr()
         self.disabled = False
@@ -285,13 +309,15 @@ class QuickAllReduce:
         self.flydsl_qr = fly
         logger.info(
             "Custom quick allreduce: bf16 INT4 uses the AITER FlyDSL kernel "
-            "(grids=%s).",
+            "(grids=%s, scope=%s).",
             {st: eng.grid for st, eng in fly._by_st.items()},
+            self.flydsl_scope,
         )
 
     def use_flydsl(self, inp: torch.Tensor) -> bool:
         return (
             self.flydsl_qr is not None
+            and self.flydsl_scope in ("both", _qr_role)
             and inp.dtype == torch.bfloat16
             and inp.is_contiguous()
             and inp.data_ptr() % 16 == 0
